@@ -22,6 +22,8 @@ use Kongono\Core\Kernel;
 use Kongono\Core\KernelState;
 use Kongono\Core\Log\Logger;
 use Kongono\Core\OperationScope;
+use Kongono\Core\Telemetry\Metrics;
+use Kongono\Core\Telemetry\Tracer;
 use PHPUnit\Framework\TestCase;
 use stdClass;
 
@@ -199,5 +201,25 @@ final class CoreTest extends TestCase
             @unlink($envFile);
             @rmdir($tmp);
         }
+    }
+
+    public function testMetricsPrometheusExportAndTracerServerTiming(): void
+    {
+        $metrics = new Metrics();
+        $metrics->increment('kongono_http_requests_total', ['method' => 'GET', 'status' => '200']);
+        $metrics->increment('kongono_http_requests_total', ['method' => 'GET', 'status' => '200']);
+        $metrics->gauge('kongono_active_workers', 4.0);
+        $metrics->observe('kongono_request_ms', 12.5, ['route' => 'home']);
+
+        self::assertSame(2.0, $metrics->counterValue('kongono_http_requests_total', ['status' => '200', 'method' => 'GET']));
+        $prom = $metrics->toPrometheus();
+        self::assertStringContainsString('kongono_http_requests_total{method="GET",status="200"} 2', $prom);
+        self::assertStringContainsString('kongono_active_workers 4', $prom);
+        self::assertStringContainsString('kongono_request_ms_count{route="home"} 1', $prom);
+
+        $tracer = new Tracer();
+        $val = $tracer->span('db_query', static fn(): int => 123);
+        self::assertSame(123, $val);
+        self::assertStringContainsString('db_query;dur=', $tracer->toServerTimingHeader());
     }
 }
