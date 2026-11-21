@@ -31,6 +31,9 @@ use Kongono\Core\Notifications\Notification;
 use Kongono\Core\Notifications\NotificationChannelInterface;
 use Kongono\Core\Notifications\NotificationDispatcher;
 use Kongono\Core\OperationScope;
+use Kongono\Core\Resilience\CircuitBreaker;
+use Kongono\Core\Resilience\CircuitState;
+use Kongono\Core\Resilience\Retry;
 use Kongono\Core\Telemetry\Metrics;
 use Kongono\Core\Telemetry\Tracer;
 use PHPUnit\Framework\TestCase;
@@ -379,5 +382,63 @@ final class CoreTest extends TestCase
         self::assertStringNotContainsString('secret_abc123', $results['sms']['error'] ?? '');
         self::assertStringContainsString('[REDACTED]', $results['sms']['error'] ?? '');
         self::assertFalse($results['missing']['ok']);
+    }
+
+    public function testRetryExponentialBackoffAndCircuitBreakerLifecycle(): void
+    {
+        $delays = [];
+        $result = Retry::run(
+            static function (int $attempt): string {
+                if ($attempt < 3) {
+                    throw new CoreException('Transient timeout');
+                }
+
+                return 'recovered';
+            },
+            maxAttempts: 4,
+            baseDelayMs: 10,
+            sleeper: static function (int $ms) use (&$delays): void {
+                $delays[] = $ms;
+            },
+        );
+
+        self::assertSame('recovered', $result);
+        self::assertSame([10, 20], $delays);
+
+        // CircuitBreaker Closed -> Open -> fails fast -> HalfOpen -> Closed
+        $cb = new CircuitBreaker('stripe-api', failureThreshold: 2, recoveryTimeoutSeconds: 30);
+        self::assertSame(CircuitState::Closed, $cb->state(1000));
+
+        for ($i = 0; $i < 2; ++$i) {
+            try {
+                $cb->call(static function (): never {
+                    throw new CoreException('Upstream 503');
+                }, now: 1000 + $i);
+            } catch (CoreException) {
+                // Expected failure
+            }
+        }
+        self::assertSame(CircuitState::Open, $cb->state(1010));
+
+        // Open circuit fails fast without invoking callback
+        $invoked = false;
+        try {
+            $cb->call(static function () use (&$invoked): string {
+                $invoked = true;
+
+                return 'should-not-run';
+            }, now: 1015);
+            self::fail('Expected open circuit to fail fast.');
+        } catch (CoreException $e) {
+            self::assertFalse($invoked);
+            self::assertStringContainsString('OPEN', $e->getMessage());
+        }
+
+        // After recovery cooldown elapses, HalfOpen probe succeeds and closes circuit
+        self::assertSame(CircuitState::HalfOpen, $cb->state(1035));
+        $recovered = $cb->call(static fn(): string => 'ok', now: 1035);
+        self::assertSame('ok', $recovered);
+        self::assertSame(CircuitState::Closed, $cb->state(1035));
+        self::assertSame(0, $cb->consecutiveFailures());
     }
 }

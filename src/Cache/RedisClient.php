@@ -193,6 +193,95 @@ final class RedisClient
         return $result;
     }
 
+    public function hSet(string $key, string $field, string $value): int
+    {
+        $reply = $this->command('HSET', $key, $field, $value);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    public function hGet(string $key, string $field): ?string
+    {
+        $reply = $this->command('HGET', $key, $field);
+
+        return is_string($reply) ? $reply : null;
+    }
+
+    public function hDel(string $key, string ...$fields): int
+    {
+        if ([] === $fields) {
+            return 0;
+        }
+        $reply = $this->command('HDEL', $key, ...$fields);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    /** @return array<string, string> */
+    public function hGetAll(string $key): array
+    {
+        $reply = $this->command('HGETALL', $key);
+        if (!is_array($reply)) {
+            return [];
+        }
+        $out = [];
+        $count = count($reply);
+        for ($i = 0; $i + 1 < $count; $i += 2) {
+            $k = $reply[$i];
+            $v = $reply[$i + 1];
+            if (is_string($k) && is_string($v)) {
+                $out[$k] = $v;
+            }
+        }
+
+        return $out;
+    }
+
+    public function zAdd(string $key, float $score, string $member): int
+    {
+        $reply = $this->command('ZADD', $key, (string) $score, $member);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    /** @return list<string> */
+    public function zRangeByScore(string $key, string $min, string $max, ?int $limit = null): array
+    {
+        $args = ['ZRANGEBYSCORE', $key, $min, $max];
+        if (null !== $limit && $limit > 0) {
+            array_push($args, 'LIMIT', '0', (string) $limit);
+        }
+        $reply = $this->command(...$args);
+        if (!is_array($reply)) {
+            return [];
+        }
+        $out = [];
+        foreach ($reply as $item) {
+            if (is_string($item)) {
+                $out[] = $item;
+            }
+        }
+
+        return $out;
+    }
+
+    public function zRem(string $key, string ...$members): int
+    {
+        if ([] === $members) {
+            return 0;
+        }
+        $reply = $this->command('ZREM', $key, ...$members);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    public function zCard(string $key): int
+    {
+        $reply = $this->command('ZCARD', $key);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
     public function close(): void
     {
         if (is_resource($this->stream)) {
