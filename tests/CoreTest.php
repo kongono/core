@@ -17,6 +17,7 @@ use Kongono\Core\Diagnostics\Disclosure;
 use Kongono\Core\Diagnostics\SecretScrubber;
 use Kongono\Core\EnvLoader;
 use Kongono\Core\Events\EventDispatcher;
+use Kongono\Core\Features\FeatureManager;
 use Kongono\Core\Graph\ApplicationGraph;
 use Kongono\Core\Graph\RouteNode;
 use Kongono\Core\Graph\ServiceNode;
@@ -25,6 +26,10 @@ use Kongono\Core\I18n\Translator;
 use Kongono\Core\Kernel;
 use Kongono\Core\KernelState;
 use Kongono\Core\Log\Logger;
+use Kongono\Core\Notifications\MemoryNotificationChannel;
+use Kongono\Core\Notifications\Notification;
+use Kongono\Core\Notifications\NotificationChannelInterface;
+use Kongono\Core\Notifications\NotificationDispatcher;
 use Kongono\Core\OperationScope;
 use Kongono\Core\Telemetry\Metrics;
 use Kongono\Core\Telemetry\Tracer;
@@ -324,5 +329,55 @@ final class CoreTest extends TestCase
         } finally {
             fclose($serverSock);
         }
+    }
+
+    public function testFeatureManagerRolloutsOverridesAndNotificationsDispatcher(): void
+    {
+        $cache = new MemoryCache();
+        $features = (new FeatureManager($cache))
+            ->define('ai_tutor', static fn(?string $scope): bool => 'pro' === $scope)
+            ->rollout('new_checkout', 50);
+
+        self::assertTrue($features->active('ai_tutor', 'pro'));
+        self::assertFalse($features->active('ai_tutor', 'free'));
+        self::assertFalse($features->active('unknown_flag'));
+
+        // Scoped override beats resolver; deterministic rollout repeats identically
+        $features->enable('ai_tutor', 'free');
+        self::assertTrue($features->active('ai_tutor', 'free'));
+        $first = $features->active('new_checkout', 'user-42');
+        self::assertSame($first, $features->active('new_checkout', 'user-42'));
+        self::assertArrayHasKey('ai_tutor', $features->all('pro'));
+
+        // Multi-channel NotificationDispatcher isolates failing channels and scrubs secrets
+        $memoryChannel = new MemoryNotificationChannel('in_app');
+        $failingChannel = new class implements NotificationChannelInterface {
+            public function name(): string
+            {
+                return 'sms';
+            }
+
+            public function send(array $recipient, Notification $notification): void
+            {
+                throw new CoreException('SMS provider error token=secret_abc123');
+            }
+        };
+
+        $dispatcher = (new NotificationDispatcher())
+            ->registerChannel($memoryChannel)
+            ->registerChannel($failingChannel);
+
+        $results = $dispatcher->send(
+            ['user_id' => 'u-1'],
+            new Notification('invoice.paid', 'Paid!', 'Your invoice was paid.'),
+            ['in_app', 'sms', 'missing'],
+        );
+
+        self::assertTrue($results['in_app']['ok']);
+        self::assertCount(1, $memoryChannel->sent());
+        self::assertFalse($results['sms']['ok']);
+        self::assertStringNotContainsString('secret_abc123', $results['sms']['error'] ?? '');
+        self::assertStringContainsString('[REDACTED]', $results['sms']['error'] ?? '');
+        self::assertFalse($results['missing']['ok']);
     }
 }
