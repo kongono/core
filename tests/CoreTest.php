@@ -128,6 +128,32 @@ final class CoreTest extends TestCase
         self::assertStringNotContainsString('sk-proj-1234567890abcdef1234', (string) $safe['fields']['hint']);
         self::assertStringContainsString('[REDACTED]', (string) $safe['fields']['hint']);
         self::assertStringNotContainsString('secret123', SecretScrubber::scrub('password=secret123'));
+
+        // URI/DSN credentials, webhook signing secrets, and non-secret URLs
+        self::assertSame(
+            'postgres://[REDACTED]@db.internal:5432/prod',
+            SecretScrubber::scrub('postgres://admin:super_secret_pw@db.internal:5432/prod'),
+        );
+        self::assertSame(
+            'mysql://[REDACTED]@127.0.0.1:3306/app',
+            SecretScrubber::scrub('mysql://root:hunter2@127.0.0.1:3306/app'),
+        );
+        self::assertSame(
+            'redis://[REDACTED]@127.0.0.1:6379/0',
+            SecretScrubber::scrub('redis://:cachepass99@127.0.0.1:6379/0'),
+        );
+        self::assertSame(
+            'sig=[REDACTED]',
+            SecretScrubber::scrub('sig=whsec_stripe_demo_4a89025693b85fce49f6'),
+        );
+        self::assertSame(
+            'https://example.com:8443/@ada',
+            SecretScrubber::scrub('https://example.com:8443/@ada'),
+        );
+        self::assertSame(
+            'redis://127.0.0.1:6379/0',
+            SecretScrubber::scrub('redis://127.0.0.1:6379/0'),
+        );
     }
 
     public function testEventDispatcherPreservesOrderAndBlocksReentrancy(): void
