@@ -18,6 +18,8 @@ use Kongono\Core\Events\EventDispatcher;
 use Kongono\Core\Graph\ApplicationGraph;
 use Kongono\Core\Graph\RouteNode;
 use Kongono\Core\Graph\ServiceNode;
+use Kongono\Core\Health\HealthCheck;
+use Kongono\Core\I18n\Translator;
 use Kongono\Core\Kernel;
 use Kongono\Core\KernelState;
 use Kongono\Core\Log\Logger;
@@ -221,5 +223,61 @@ final class CoreTest extends TestCase
         $val = $tracer->span('db_query', static fn(): int => 123);
         self::assertSame(123, $val);
         self::assertStringContainsString('db_query;dur=', $tracer->toServerTimingHeader());
+    }
+
+    public function testTranslatorInterpolationPluralizationAndNegotiation(): void
+    {
+        $translator = (new Translator('en'))
+            ->addMessages('en', [
+                'welcome' => 'Hello, :name!',
+                'items' => 'No items|One item|:count items',
+                'files' => '1 file|:count files',
+                'only_en' => 'English fallback',
+            ])
+            ->addMessages('fr', [
+                'welcome' => 'Bonjour, :name !',
+            ]);
+
+        self::assertSame('Hello, Ada!', $translator->get('welcome', ['name' => 'Ada']));
+        self::assertSame('Bonjour, Ada !', $translator->get('welcome', ['name' => 'Ada'], 'fr-CA'));
+        self::assertSame('English fallback', $translator->get('only_en', [], 'fr'));
+        self::assertSame('missing.key', $translator->get('missing.key'));
+
+        self::assertSame('No items', $translator->choice('items', 0));
+        self::assertSame('One item', $translator->choice('items', 1));
+        self::assertSame('5 items', $translator->choice('items', 5));
+        self::assertSame('1 file', $translator->choice('files', 1));
+        self::assertSame('3 files', $translator->choice('files', 3));
+
+        self::assertSame('fr', $translator->negotiate('de-DE, fr-CA;q=0.9, en;q=0.8'));
+        self::assertSame('en', $translator->negotiate('es-MX'));
+    }
+
+    public function testHealthCheckReportsOkAndDegradedWithScrubbedErrors(): void
+    {
+        $healthy = (new HealthCheck())
+            ->check('db', static fn(): bool => true)
+            ->check('cache', static fn(): bool => true)
+            ->run();
+
+        self::assertSame('ok', $healthy['status']);
+        self::assertTrue($healthy['healthy']);
+        self::assertTrue($healthy['checks']['db']['ok']);
+
+        $degraded = (new HealthCheck())
+            ->check('ok_probe', static fn(): bool => true)
+            ->check('false_probe', static fn(): bool => false)
+            ->check('crash_probe', static function (): bool {
+                throw new CoreException('Failed auth password=supersecretvalue');
+            })
+            ->run();
+
+        self::assertSame('degraded', $degraded['status']);
+        self::assertFalse($degraded['healthy']);
+        self::assertFalse($degraded['checks']['false_probe']['ok']);
+        self::assertFalse($degraded['checks']['crash_probe']['ok']);
+        self::assertArrayHasKey('error', $degraded['checks']['crash_probe']);
+        self::assertStringNotContainsString('supersecretvalue', $degraded['checks']['crash_probe']['error']);
+        self::assertStringContainsString('[REDACTED]', $degraded['checks']['crash_probe']['error']);
     }
 }
