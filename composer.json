@@ -1,0 +1,17 @@
+{
+  "name": "kongono/core",
+  "description": "Kongono v1 persistent-runtime kernel, DI container, config, nondisclosing diagnostics, events, and ApplicationGraph.",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.5.0",
+    "psr/container": "^2.0",
+    "psr/event-dispatcher": "^1.0",
+    "psr/log": "^3.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Kongono\\Core\\": "src/"
+    }
+  }
+}
