@@ -6,6 +6,8 @@ namespace Kongono\Core\Tests;
 
 use Kongono\Core\Cache\FileCache;
 use Kongono\Core\Cache\MemoryCache;
+use Kongono\Core\Cache\RedisCache;
+use Kongono\Core\Cache\RedisClient;
 use Kongono\Core\Config;
 use Kongono\Core\Container;
 use Kongono\Core\ContainerException;
@@ -279,5 +281,48 @@ final class CoreTest extends TestCase
         self::assertArrayHasKey('error', $degraded['checks']['crash_probe']);
         self::assertStringNotContainsString('supersecretvalue', $degraded['checks']['crash_probe']['error']);
         self::assertStringContainsString('[REDACTED]', $degraded['checks']['crash_probe']['error']);
+    }
+
+    public function testRedisClientRespProtocolAndRedisCache(): void
+    {
+        self::assertSame("*2\r\n\$3\r\nGET\r\n\$3\r\nfoo\r\n", RedisClient::encodeCommand('GET', 'foo'));
+
+        $pair = stream_socket_pair(STREAM_PF_INET, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        self::assertIsArray($pair);
+        [$clientSock, $serverSock] = $pair;
+
+        // Preload deterministic RESP2/RESP3 replies onto the peer socket buffer
+        $payload = json_encode(['name' => 'Kongono'], JSON_THROW_ON_ERROR);
+        fwrite(
+            $serverSock,
+            "+PONG\r\n"
+            . "+OK\r\n"
+            . '$' . strlen($payload) . "\r\n" . $payload . "\r\n"
+            . ":1\r\n"
+            . "$-1\r\n"
+            . "+OK\r\n"
+            . "*1\r\n\$16\r\nkongono:cache:k1\r\n"
+            . ":1\r\n",
+        );
+
+        try {
+            $redis = RedisClient::fromStream($clientSock);
+            self::assertSame('PONG', $redis->ping());
+
+            $cache = new RedisCache($redis);
+            $cache->set('k1', ['name' => 'Kongono'], ttlSeconds: 60);
+            self::assertSame(['name' => 'Kongono'], $cache->get('k1'));
+            self::assertTrue($cache->has('k1'));
+
+            // remember() miss computes & stores value
+            $computed = $cache->remember('k2', 60, static fn(): string => 'computed');
+            self::assertSame('computed', $computed);
+
+            // clear() only deletes prefixed keys
+            $cache->clear();
+            $redis->close();
+        } finally {
+            fclose($serverSock);
+        }
     }
 }
