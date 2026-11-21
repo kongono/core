@@ -295,7 +295,8 @@ final class CoreTest extends TestCase
     {
         self::assertSame("*2\r\n\$3\r\nGET\r\n\$3\r\nfoo\r\n", RedisClient::encodeCommand('GET', 'foo'));
 
-        $pair = stream_socket_pair(STREAM_PF_INET, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $domain = '\\' === DIRECTORY_SEPARATOR ? STREAM_PF_INET : STREAM_PF_UNIX;
+        $pair = stream_socket_pair($domain, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         self::assertIsArray($pair);
         [$clientSock, $serverSock] = $pair;
 
