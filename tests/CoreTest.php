@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kongono\Core\Tests;
 
+use Kongono\Core\Async\Async;
 use Kongono\Core\Cache\FileCache;
 use Kongono\Core\Cache\MemoryCache;
 use Kongono\Core\Cache\RedisCache;
@@ -497,5 +498,69 @@ final class CoreTest extends TestCase
         self::assertSame('ok', $recovered);
         self::assertSame(CircuitState::Closed, $cb->state(1035));
         self::assertSame(0, $cb->consecutiveFailures());
+    }
+
+    public function testAsyncFibersAllRaceMapAndAllSettled(): void
+    {
+        // Cooperative interleaving across Fibers preserves key order
+        $trace = [];
+        $results = Async::all([
+            'first' => static function () use (&$trace): string {
+                $trace[] = 'a1';
+                Async::suspend();
+                $trace[] = 'a2';
+
+                return 'A';
+            },
+            'second' => static function () use (&$trace): string {
+                $trace[] = 'b1';
+                Async::suspend();
+                $trace[] = 'b2';
+
+                return 'B';
+            },
+        ]);
+
+        self::assertSame(['first' => 'A', 'second' => 'B'], $results);
+        self::assertSame(['a1', 'b1', 'a2', 'b2'], $trace);
+
+        // Async::race resolves to whichever Fiber finishes first
+        $winner = Async::race([
+            'slow' => static function (): string {
+                Async::suspend();
+                Async::suspend();
+
+                return 'slow';
+            },
+            'fast' => static function (): string {
+                Async::suspend();
+
+                return 'fast';
+            },
+        ]);
+        self::assertSame('fast', $winner);
+
+        // Async::map transforms items concurrently preserving keys
+        $doubled = Async::map(['x' => 3, 'y' => 7], static function (int $v): int {
+            Async::suspend();
+
+            return $v * 2;
+        });
+        self::assertSame(['x' => 6, 'y' => 14], $doubled);
+
+        // Async::allSettled isolates exceptions without aborting siblings
+        $settled = Async::allSettled([
+            'ok' => static fn(): int => 42,
+            'boom' => static function (): int {
+                throw new CoreException('isolated');
+            },
+        ]);
+        self::assertTrue($settled['ok']['ok']);
+        self::assertSame(42, $settled['ok']['value']);
+        self::assertFalse($settled['boom']['ok']);
+        self::assertSame('isolated', $settled['boom']['error']->getMessage());
+
+        // Calling Async::suspend() outside a Fiber is a safe no-op
+        self::assertSame('pass', Async::suspend('pass'));
     }
 }
