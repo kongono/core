@@ -21,6 +21,7 @@ final class SecretScrubber
         ['/ghp_[A-Za-z0-9]{20,}/', '[REDACTED]'],
         ['/github_pat_[A-Za-z0-9_]{20,}/', '[REDACTED]'],
         ['/whsec_[A-Za-z0-9_-]{16,}/', '[REDACTED]'],
+        ['/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/', '[REDACTED]'],
         ['/\bAKIA[0-9A-Z]{16}\b/', '[REDACTED]'],
         // Bearer tokens and compact JWTs
         ['/Bearer\s+[A-Za-z0-9._~+\/-]+=*/i', 'Bearer [REDACTED]'],
@@ -43,6 +44,11 @@ final class SecretScrubber
         'private_key',
         'client_secret',
         'webhook_secret',
+        'cookie',
+        'set_cookie',
+        'set-cookie',
+        'session_id',
+        'signing_key',
     ];
 
     public static function scrub(string $text): string
