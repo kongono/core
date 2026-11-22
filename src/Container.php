@@ -8,7 +8,6 @@ use Closure;
 use Psr\Container\ContainerInterface;
 use ReflectionClass;
 use ReflectionNamedType;
-use ReflectionParameter;
 
 /**
  * Explicit, zero-magic PSR-11 dependency injection container with autowiring
@@ -30,6 +29,22 @@ final class Container implements ContainerInterface
 
     /** @var array<string, true> */
     private array $resolving = [];
+
+    /** @var array<string, bool> */
+    private array $instantiableCache = [];
+
+    /**
+     * Compiled per-class constructor wiring plans (populated once per persistent worker).
+     *
+     * @var array<string, list<array{
+     *     name: string,
+     *     classType: ?string,
+     *     hasDefault: bool,
+     *     default: mixed,
+     *     allowsNull: bool
+     * }>>
+     */
+    private array $autowirePlans = [];
 
     /**
      * Bind a transient factory or concrete class to an ID/interface.
@@ -92,12 +107,24 @@ final class Container implements ContainerInterface
         return $this;
     }
 
-    public function has(string $id): bool
+    /** O(1) check whether an explicit binding, singleton, or scoped instance is registered (zero reflection, zero sort). */
+    public function hasBinding(string $id): bool
     {
         return array_key_exists($id, $this->singletons)
             || array_key_exists($id, $this->scopedInstances)
-            || array_key_exists($id, $this->factories)
-            || (class_exists($id) && (new ReflectionClass($id))->isInstantiable());
+            || array_key_exists($id, $this->factories);
+    }
+
+    public function has(string $id): bool
+    {
+        if ($this->hasBinding($id)) {
+            return true;
+        }
+        if (isset($this->instantiableCache[$id])) {
+            return $this->instantiableCache[$id];
+        }
+
+        return $this->instantiableCache[$id] = class_exists($id) && (new ReflectionClass($id))->isInstantiable();
     }
 
     public function get(string $id): mixed
@@ -200,55 +227,73 @@ final class Container implements ContainerInterface
      */
     private function autowire(string $class): object
     {
-        $reflection = new ReflectionClass($class);
-        if (!$reflection->isInstantiable()) {
-            throw new ContainerException(sprintf('Class "%s" is not instantiable.', $class));
+        $plan = $this->autowirePlans[$class] ?? null;
+        if (null === $plan) {
+            $reflection = new ReflectionClass($class);
+            if (!$reflection->isInstantiable()) {
+                $this->instantiableCache[$class] = false;
+                throw new ContainerException(sprintf('Class "%s" is not instantiable.', $class));
+            }
+            $this->instantiableCache[$class] = true;
+
+            $plan = [];
+            $constructor = $reflection->getConstructor();
+            if (null !== $constructor) {
+                foreach ($constructor->getParameters() as $parameter) {
+                    $type = $parameter->getType();
+                    $hasDefault = $parameter->isDefaultValueAvailable();
+                    $plan[] = [
+                        'name' => $parameter->getName(),
+                        'classType' => ($type instanceof ReflectionNamedType && !$type->isBuiltin()) ? $type->getName() : null,
+                        'hasDefault' => $hasDefault,
+                        'default' => $hasDefault ? $parameter->getDefaultValue() : null,
+                        'allowsNull' => $type instanceof ReflectionNamedType ? $type->allowsNull() : true,
+                    ];
+                }
+            }
+            $this->autowirePlans[$class] = $plan;
         }
 
-        $constructor = $reflection->getConstructor();
-        if (null === $constructor) {
-            return $reflection->newInstance();
+        if ([] === $plan) {
+            return new $class();
         }
 
         $arguments = [];
-        foreach ($constructor->getParameters() as $parameter) {
-            $arguments[] = $this->resolveParameter($class, $parameter);
-        }
+        foreach ($plan as $param) {
+            if (null !== $param['classType']) {
+                if ($this->has($param['classType'])) {
+                    $arguments[] = $this->get($param['classType']);
+                    continue;
+                }
+                if ($param['hasDefault']) {
+                    $arguments[] = $param['default'];
+                    continue;
+                }
+                if ($param['allowsNull']) {
+                    $arguments[] = null;
+                    continue;
+                }
 
-        return $reflection->newInstanceArgs($arguments);
-    }
+                throw new ContainerException(sprintf(
+                    'Cannot resolve parameter "$%s" (%s) of %s::__construct().',
+                    $param['name'],
+                    $param['classType'],
+                    $class,
+                ));
+            }
 
-    private function resolveParameter(string $class, ReflectionParameter $parameter): mixed
-    {
-        $type = $parameter->getType();
-        if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
-            $typeName = $type->getName();
-            if ($this->has($typeName)) {
-                return $this->get($typeName);
-            }
-            if ($parameter->isDefaultValueAvailable()) {
-                return $parameter->getDefaultValue();
-            }
-            if ($type->allowsNull()) {
-                return null;
+            if ($param['hasDefault']) {
+                $arguments[] = $param['default'];
+                continue;
             }
 
             throw new ContainerException(sprintf(
-                'Cannot resolve parameter "$%s" (%s) of %s::__construct().',
-                $parameter->getName(),
-                $typeName,
+                'Cannot autowire scalar/untyped parameter "$%s" of %s::__construct(). Bind it explicitly.',
+                $param['name'],
                 $class,
             ));
         }
 
-        if ($parameter->isDefaultValueAvailable()) {
-            return $parameter->getDefaultValue();
-        }
-
-        throw new ContainerException(sprintf(
-            'Cannot autowire scalar/untyped parameter "$%s" of %s::__construct(). Bind it explicitly.',
-            $parameter->getName(),
-            $class,
-        ));
+        return new $class(...$arguments);
     }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kongono\Core\Cache;
 
+use Closure;
 use Kongono\Core\CoreException;
 use SensitiveParameter;
 
@@ -11,6 +12,7 @@ use SensitiveParameter;
  * Zero-dependency pure PHP 8.5 Redis / Valkey RESP2 & RESP3 client over TCP/TLS sockets.
  *
  * Supports `redis://` and `rediss://` URLs, password/ACL authentication, database selection,
+ * automatic transparent reconnection on idle socket drops in persistent workers,
  * and deterministic stream injection (`fromStream()`) for offline protocol testing.
  */
 final class RedisClient
@@ -23,10 +25,17 @@ final class RedisClient
     /** @var resource|null */
     private mixed $stream;
 
-    /** @param resource $stream */
-    private function __construct(mixed $stream)
+    /** @var ?Closure(): resource */
+    private ?Closure $connector;
+
+    /**
+     * @param resource             $stream
+     * @param ?Closure(): resource $connector
+     */
+    private function __construct(mixed $stream, ?Closure $connector = null)
     {
         $this->stream = $stream;
+        $this->connector = $connector;
     }
 
     public static function connect(
@@ -44,48 +53,55 @@ final class RedisClient
             throw new CoreException(sprintf('Invalid Redis port %d.', $port));
         }
 
-        $scheme = $tls ? 'tls' : 'tcp';
-        $errno = 0;
-        $errstr = '';
-        $peerName = trim($cleanHost, '[]');
-        $context = $tls
-            ? stream_context_create([
-                'ssl' => [
-                    'verify_peer' => true,
-                    'verify_peer_name' => true,
-                    'allow_self_signed' => false,
-                    'peer_name' => $peerName,
-                    'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
-                ],
-            ])
-            : stream_context_create();
-        $stream = @stream_socket_client(
-            sprintf('%s://%s:%d', $scheme, $cleanHost, $port),
-            $errno,
-            $errstr,
-            $timeout,
-            STREAM_CLIENT_CONNECT,
-            $context,
-        );
-        if (!is_resource($stream)) {
-            throw new CoreException(sprintf('Unable to connect to Redis at %s:%d (%s).', $host, $port, $errstr));
-        }
-
-        stream_set_timeout($stream, (int) $timeout, (int) (($timeout - floor($timeout)) * 1_000_000));
-        $client = new self($stream);
-
-        if (null !== $password && '' !== $password) {
-            if (null !== $username && '' !== $username) {
-                $client->command('AUTH', $username, $password);
-            } else {
-                $client->command('AUTH', $password);
+        $connector = static function () use ($host, $cleanHost, $port, $password, $database, $tls, $timeout, $username): mixed {
+            $scheme = $tls ? 'tls' : 'tcp';
+            $errno = 0;
+            $errstr = '';
+            $peerName = trim($cleanHost, '[]');
+            $context = $tls
+                ? stream_context_create([
+                    'ssl' => [
+                        'verify_peer' => true,
+                        'verify_peer_name' => true,
+                        'allow_self_signed' => false,
+                        'peer_name' => $peerName,
+                        'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
+                    ],
+                ])
+                : stream_context_create();
+            $stream = @stream_socket_client(
+                sprintf('%s://%s:%d', $scheme, $cleanHost, $port),
+                $errno,
+                $errstr,
+                $timeout,
+                STREAM_CLIENT_CONNECT,
+                $context,
+            );
+            if (!is_resource($stream)) {
+                throw new CoreException(sprintf('Unable to connect to Redis at %s:%d (%s).', $host, $port, $errstr));
             }
-        }
-        if ($database > 0) {
-            $client->command('SELECT', (string) $database);
-        }
 
-        return $client;
+            stream_set_timeout($stream, (int) $timeout, (int) (($timeout - floor($timeout)) * 1_000_000));
+            $bootstrap = new self($stream);
+
+            if (null !== $password && '' !== $password) {
+                if (null !== $username && '' !== $username) {
+                    $bootstrap->command('AUTH', $username, $password);
+                } else {
+                    $bootstrap->command('AUTH', $password);
+                }
+            }
+            if ($database > 0) {
+                $bootstrap->command('SELECT', (string) $database);
+            }
+
+            return $stream;
+        };
+
+        /** @var resource $stream */
+        $stream = $connector();
+
+        return new self($stream, $connector);
     }
 
     public static function fromUrl(#[SensitiveParameter] string $url, float $timeout = 3.0): self
@@ -112,15 +128,27 @@ final class RedisClient
     /**
      * Wrap an existing stream resource (e.g. `stream_socket_pair` in unit tests).
      *
-     * @param resource $stream
+     * @param resource             $stream
+     * @param ?Closure(): resource $connector Optional reconnect factory for transport-recovery tests
      */
-    public static function fromStream(mixed $stream): self
+    public static function fromStream(mixed $stream, ?Closure $connector = null): self
     {
         if (!is_resource($stream)) {
             throw new CoreException('RedisClient::fromStream() requires a valid stream resource.');
         }
 
-        return new self($stream);
+        return new self($stream, $connector);
+    }
+
+    /** Re-establish the Redis TCP/TLS connection when a connector factory is present. */
+    public function reconnect(): void
+    {
+        $connector = $this->connector;
+        if (null === $connector) {
+            throw new CoreException('Redis client cannot reconnect without a connector factory.');
+        }
+        $this->close();
+        $this->stream = $connector();
     }
 
     /** Encode one Redis command as a RESP array of bulk strings. */
@@ -136,11 +164,39 @@ final class RedisClient
 
     public function command(string ...$args): mixed
     {
+        $wire = self::encodeCommand(...$args);
+        $attempts = null !== $this->connector ? 2 : 1;
+
+        for ($attempt = 1; $attempt <= $attempts; ++$attempt) {
+            if (!is_resource($this->stream)) {
+                if ($attempt < $attempts && null !== $this->connector) {
+                    $this->reconnect();
+                } else {
+                    throw new CoreException('Redis connection is closed.');
+                }
+            }
+
+            try {
+                return $this->sendAndRead($wire);
+            } catch (CoreException $e) {
+                if ($attempt < $attempts && null !== $this->connector && $this->isTransportError($e)) {
+                    $this->reconnect();
+                    continue;
+                }
+
+                throw $e;
+            }
+        }
+
+        throw new CoreException('Redis command execution failed.');
+    }
+
+    private function sendAndRead(string $wire): mixed
+    {
         if (!is_resource($this->stream)) {
             throw new CoreException('Redis connection is closed.');
         }
 
-        $wire = self::encodeCommand(...$args);
         $total = strlen($wire);
         $written = 0;
         while ($written < $total) {
@@ -153,6 +209,15 @@ final class RedisClient
         }
 
         return $this->readReply();
+    }
+
+    private function isTransportError(CoreException $e): bool
+    {
+        $msg = $e->getMessage();
+
+        return str_contains($msg, 'Failed writing command to Redis stream')
+            || str_contains($msg, 'Unexpected EOF while reading Redis reply')
+            || str_contains($msg, 'Redis connection is closed');
     }
 
     public function ping(): string
@@ -350,6 +415,27 @@ LUA;
     public function zCard(string $key): int
     {
         $reply = $this->command('ZCARD', $key);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    public function zRemRangeByRank(string $key, int $start, int $stop): int
+    {
+        $reply = $this->command('ZREMRANGEBYRANK', $key, (string) $start, (string) $stop);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    public function hIncrBy(string $key, string $field, int $delta): int
+    {
+        $reply = $this->command('HINCRBY', $key, $field, (string) $delta);
+
+        return is_int($reply) ? $reply : 0;
+    }
+
+    public function publish(string $channel, string $message): int
+    {
+        $reply = $this->command('PUBLISH', $channel, $message);
 
         return is_int($reply) ? $reply : 0;
     }

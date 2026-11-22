@@ -801,4 +801,53 @@ final class CoreTest extends TestCase
             @unlink($envFile);
         }
     }
+
+    public function testRedisClientAutoReconnectContainerHasBindingAndCacheFactory(): void
+    {
+        // 1. RedisClient transparently reconnects once when a persistent worker socket drops
+        $domain = '\\' === DIRECTORY_SEPARATOR ? STREAM_PF_INET : STREAM_PF_UNIX;
+        $pair1 = stream_socket_pair($domain, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $pair2 = stream_socket_pair($domain, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        self::assertIsArray($pair1);
+        self::assertIsArray($pair2);
+        [$c1, $s1] = $pair1;
+        [$c2, $s2] = $pair2;
+
+        // Immediately close server side of socket 1 to simulate an idle disconnect / EOF
+        fclose($s1);
+        fwrite($s2, "+PONG\r\n");
+
+        $reconnectCount = 0;
+        try {
+            $redis = RedisClient::fromStream($c1, static function () use (&$reconnectCount, $c2) {
+                ++$reconnectCount;
+
+                return $c2;
+            });
+            self::assertSame('PONG', $redis->ping());
+            self::assertSame(1, $reconnectCount);
+            $redis->close();
+        } finally {
+            fclose($s2);
+        }
+
+        // 2. Container::hasBinding() is O(1) and cached autowiring resolves repeatedly cleanly
+        $container = new Container();
+        $container->instance(\stdClass::class, (object) ['ok' => true]);
+        self::assertTrue($container->hasBinding(\stdClass::class));
+        self::assertFalse($container->hasBinding(MemoryCache::class));
+        $cA = $container->make(MemoryCache::class);
+        $cB = $container->make(MemoryCache::class);
+        self::assertInstanceOf(MemoryCache::class, $cA);
+        self::assertInstanceOf(MemoryCache::class, $cB);
+
+        // 3. CacheFactory falls back to FileCache when REDIS_URL is unset
+        $tmpCacheDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'kongono-cache-factory-' . bin2hex(random_bytes(4));
+        try {
+            $factoryCache = \Kongono\Core\Cache\CacheFactory::fromEnv($tmpCacheDir, redisUrlOverride: '');
+            self::assertInstanceOf(FileCache::class, $factoryCache);
+        } finally {
+            @rmdir($tmpCacheDir);
+        }
+    }
 }
