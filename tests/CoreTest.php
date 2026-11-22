@@ -154,6 +154,36 @@ final class CoreTest extends TestCase
             'redis://127.0.0.1:6379/0',
             SecretScrubber::scrub('redis://127.0.0.1:6379/0'),
         );
+
+        // v1.2.0: key-preserving scrub (zero double brackets), PEM keys, Stripe live keys, and recursive scrubArray()
+        self::assertSame(
+            'OPENAI_API_KEY=[REDACTED]',
+            SecretScrubber::scrub('OPENAI_API_KEY=sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ123456'),
+        );
+        self::assertSame(
+            'STRIPE_WEBHOOK_SECRET=[REDACTED]',
+            SecretScrubber::scrub('STRIPE_WEBHOOK_SECRET=whsec_9f8e7d6c5b4a3210fedcba9876543210'),
+        );
+        self::assertSame(
+            'Authorization: Bearer [REDACTED]',
+            SecretScrubber::scrub('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def'),
+        );
+        self::assertSame(
+            '[REDACTED_PRIVATE_KEY]',
+            SecretScrubber::scrub("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"),
+        );
+
+        $scrubbedArr = SecretScrubber::scrubArray([
+            'user' => 'maya',
+            'password' => 'hunter2',
+            'stripe_api_key' => 'sk_live_1234567890abcdef1234',
+            'nested' => ['dsn' => 'postgres://admin:secretpw@db:5432/app'],
+        ]);
+        self::assertSame('maya', $scrubbedArr['user']);
+        self::assertSame('[REDACTED]', $scrubbedArr['password']);
+        self::assertSame('[REDACTED]', $scrubbedArr['stripe_api_key']);
+        self::assertIsArray($scrubbedArr['nested']);
+        self::assertSame('postgres://[REDACTED]@db:5432/app', $scrubbedArr['nested']['dsn']);
     }
 
     public function testEventDispatcherPreservesOrderAndBlocksReentrancy(): void
