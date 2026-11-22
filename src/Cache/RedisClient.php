@@ -15,6 +15,10 @@ use SensitiveParameter;
  */
 final class RedisClient
 {
+    private const int MAX_BULK_BYTES = 16_777_216;
+    private const int MAX_ARRAY_ELEMENTS = 100_000;
+    private const int MAX_NESTING_DEPTH = 16;
+
     /** @var resource|null */
     private mixed $stream;
 
@@ -37,7 +41,25 @@ final class RedisClient
         $scheme = $tls ? 'tls' : 'tcp';
         $errno = 0;
         $errstr = '';
-        $stream = @stream_socket_client(sprintf('%s://%s:%d', $scheme, $host, $port), $errno, $errstr, $timeout);
+        $context = $tls
+            ? stream_context_create([
+                'ssl' => [
+                    'verify_peer' => true,
+                    'verify_peer_name' => true,
+                    'allow_self_signed' => false,
+                    'peer_name' => $host,
+                    'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
+                ],
+            ])
+            : stream_context_create();
+        $stream = @stream_socket_client(
+            sprintf('%s://%s:%d', $scheme, $host, $port),
+            $errno,
+            $errstr,
+            $timeout,
+            STREAM_CLIENT_CONNECT,
+            $context,
+        );
         if (!is_resource($stream)) {
             throw new CoreException(sprintf('Unable to connect to Redis at %s:%d (%s).', $host, $port, $errstr));
         }
@@ -290,8 +312,11 @@ final class RedisClient
         $this->stream = null;
     }
 
-    private function readReply(): mixed
+    private function readReply(int $depth = 0): mixed
     {
+        if ($depth > self::MAX_NESTING_DEPTH) {
+            throw new CoreException('Redis RESP nesting depth exceeded maximum limit.');
+        }
         if (!is_resource($this->stream)) {
             throw new CoreException('Redis connection is closed.');
         }
@@ -312,7 +337,7 @@ final class RedisClient
             '#' => 't' === $payload,
             ',' => (float) $payload,
             '$' => $this->readBulkString((int) $payload),
-            '*' => $this->readArray((int) $payload),
+            '*' => $this->readArray((int) $payload, $depth),
             default => throw new CoreException(sprintf('Unsupported Redis RESP prefix "%s".', $prefix)),
         };
     }
@@ -321,6 +346,9 @@ final class RedisClient
     {
         if ($length < 0) {
             return null;
+        }
+        if ($length > self::MAX_BULK_BYTES) {
+            throw new CoreException(sprintf('Redis bulk string size %d exceeds maximum bound of %d bytes.', $length, self::MAX_BULK_BYTES));
         }
         if (!is_resource($this->stream)) {
             throw new CoreException('Redis connection is closed.');
@@ -341,14 +369,17 @@ final class RedisClient
     }
 
     /** @return list<mixed>|null */
-    private function readArray(int $count): ?array
+    private function readArray(int $count, int $depth = 0): ?array
     {
         if ($count < 0) {
             return null;
         }
+        if ($count > self::MAX_ARRAY_ELEMENTS) {
+            throw new CoreException(sprintf('Redis array length %d exceeds maximum bound of %d elements.', $count, self::MAX_ARRAY_ELEMENTS));
+        }
         $items = [];
         for ($i = 0; $i < $count; ++$i) {
-            $items[] = $this->readReply();
+            $items[] = $this->readReply($depth + 1);
         }
 
         return $items;

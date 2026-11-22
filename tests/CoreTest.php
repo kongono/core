@@ -563,4 +563,24 @@ final class CoreTest extends TestCase
         // Calling Async::suspend() outside a Fiber is a safe no-op
         self::assertSame('pass', Async::suspend('pass'));
     }
+
+    public function testRedisClientRejectsOversizedRespBulkStringDos(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_INET, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        if (false === $pair) {
+            self::markTestSkipped('stream_socket_pair unavailable.');
+        }
+        [$serverSock, $clientSock] = $pair;
+        fwrite($serverSock, "$999999999\r\n");
+
+        try {
+            $redis = RedisClient::fromStream($clientSock);
+            $this->expectException(CoreException::class);
+            $this->expectExceptionMessage('exceeds maximum bound');
+            $redis->get('boom');
+        } finally {
+            fclose($serverSock);
+            fclose($clientSock);
+        }
+    }
 }
