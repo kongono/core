@@ -61,7 +61,8 @@ final class CircuitBreaker
 
             return $result;
         } catch (Throwable $e) {
-            $this->recordFailure($ts);
+            // Record failure at completion time (not pre-call time) so slow timeouts still trigger full cooldown
+            $this->recordFailure($now ?? time());
             throw $e;
         }
     }

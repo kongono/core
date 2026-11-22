@@ -24,7 +24,22 @@ final class EnvLoader
         'LD_PRELOAD',
         'LD_LIBRARY_PATH',
         'PHP_INI_SCAN_DIR',
+        'PHPRC',
         'OPENSSL_CONF',
+        'HTTPS_PROXY',
+        'ALL_PROXY',
+        'NO_PROXY',
+        'CURL_CA_BUNDLE',
+        'SSL_CERT_FILE',
+        'SSL_CERT_DIR',
+        'PATH',
+        'BASH_ENV',
+        'ENV',
+        'IFS',
+        'GCONV_PATH',
+        'HOSTALIASES',
+        'RESOLV_HOST_CONF',
+        'NODE_OPTIONS',
     ];
 
     /**
@@ -66,6 +81,8 @@ final class EnvLoader
                 in_array($upperKey, self::FORBIDDEN_KEYS, true)
                 || str_starts_with($upperKey, 'HTTP_')
                 || str_starts_with($upperKey, 'DYLD_')
+                || str_starts_with($upperKey, 'PHP_INI_')
+                || str_starts_with($upperKey, 'ZEND_')
             ) {
                 continue;
             }

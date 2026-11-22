@@ -693,4 +693,112 @@ final class CoreTest extends TestCase
             @unlink($envFile);
         }
     }
+
+    public function testRound4SecretScrubberBacktrackProofRedisHostMetricsContainerCaptiveRetryAndLoggerHardening(): void
+    {
+        // 1. SecretScrubber resists PCRE backtrack bypass (1.1 MB after truncated PEM & 1M alphanumeric blob),
+        // handles escaped quotes, scrubs non-Stringable objects, secretAccessKey, session_id, smtps://, sk_test_, X-Amz-Signature
+        $hugePem = "-----BEGIN RSA PRIVATE KEY-----\nMIIE_SECRET_KEY_DATA\n" . str_repeat('A', 1_100_000);
+        self::assertSame('[REDACTED_PRIVATE_KEY]', SecretScrubber::scrub($hugePem));
+
+        $hugePrefix = str_repeat('a', 1_000_000) . ' password=SECRET_TAIL_99';
+        self::assertStringNotContainsString('SECRET_TAIL_99', SecretScrubber::scrub($hugePrefix));
+
+        $escapedJson = '{"password":"abc\"SUPER_SECRET_TAIL","secretAccessKey":"AWS_SEC_99","session_id":"SID_99"} | smtps://u:p@ss@mail.test:465 | sk_test_1234567890abcdef12 | ?X-Amz-Signature=deadbeef1234';
+        $scrubbed = SecretScrubber::scrub($escapedJson);
+        self::assertStringNotContainsString('SUPER_SECRET_TAIL', $scrubbed);
+        self::assertStringNotContainsString('AWS_SEC_99', $scrubbed);
+        self::assertStringNotContainsString('SID_99', $scrubbed);
+        self::assertStringNotContainsString('p@ss', $scrubbed);
+        self::assertStringNotContainsString('sk_test_1234567890abcdef12', $scrubbed);
+        self::assertStringNotContainsString('deadbeef1234', $scrubbed);
+
+        $obj = new class {
+            public string $apiKey = 'sk-live-secret-1234567890abcdef';
+        };
+        $scrubbedObjArr = SecretScrubber::scrubArray(['payload' => $obj]);
+        self::assertIsString($scrubbedObjArr['payload']);
+        self::assertStringNotContainsString('sk-live-secret', $scrubbedObjArr['payload']);
+
+        // 2. RedisClient blocks socket authority port-override injection (`127.0.0.1:60130#`) and non-numeric RESP lengths
+        try {
+            RedisClient::connect('127.0.0.1:60130#', 6379);
+            self::fail('Expected RedisClient::connect to reject port-override host.');
+        } catch (CoreException $e) {
+            self::assertStringContainsString('Unsafe Redis host', $e->getMessage());
+        }
+
+        // 3. FeatureManager global kill-switch is NEVER evicted by high-cardinality scoped overrides
+        $fm = new FeatureManager();
+        $fm->define('risky', static fn(): bool => true);
+        $fm->disable('risky');
+        for ($i = 0; $i < 2100; ++$i) {
+            $fm->enable('other', 'user-' . $i);
+        }
+        self::assertFalse($fm->active('risky'));
+
+        // 4. Container rejects captive scoped dependency inside a singleton
+        $container = new Container();
+        $container->scoped('req.tenant', static fn(): object => new \stdClass());
+        $container->singleton('bad.singleton', static fn(Container $c): object => (object) ['t' => $c->get('req.tenant')]);
+        try {
+            $container->get('bad.singleton');
+            self::fail('Expected captive scoped dependency inside singleton to throw ContainerException.');
+        } catch (ContainerException $e) {
+            self::assertStringContainsString('Captive scoped dependency', $e->getMessage());
+        }
+
+        // 5. Metrics rejects Prometheus exposition newline injection
+        $metrics = new Metrics();
+        try {
+            $metrics->increment("evil 1\nfake_metric");
+            self::fail('Expected invalid Prometheus metric name to throw.');
+        } catch (CoreException) {
+            self::addToAssertionCount(1);
+        }
+
+        // 6. Retry caps exponential backoff cleanly (no float TypeError at attempt 60+)
+        $delays = [];
+        try {
+            Retry::run(
+                static function (): never {
+                    throw new CoreException('boom');
+                },
+                maxAttempts: 62,
+                baseDelayMs: 100,
+                sleeper: static function (int $ms) use (&$delays): void {
+                    $delays[] = $ms;
+                },
+                maxDelayMs: 5000,
+            );
+        } catch (CoreException) {
+            // Expected after 62 attempts
+        }
+        self::assertCount(61, $delays);
+        self::assertSame(5000, $delays[60]);
+
+        // 7. Logger survives INF/NAN floats without JsonException and strips OSC ANSI escape sequences
+        $buf = fopen('php://memory', 'r+b');
+        self::assertIsResource($buf);
+        try {
+            $logger = new Logger('r4', stream: $buf, retainInMemory: true);
+            $logger->info("Hi \x1b]0;PWNED\x07", ['ratio' => INF, 'nan' => NAN]);
+            self::assertSame('INF', $logger->records()[0]['context']['ratio']);
+            self::assertSame('NAN', $logger->records()[0]['context']['nan']);
+            self::assertStringNotContainsString("\x1b]", $logger->records()[0]['message']);
+        } finally {
+            fclose($buf);
+        }
+
+        // 8. EnvLoader blocks HTTPS_PROXY, CURL_CA_BUNDLE, PHPRC, PATH, PHP_INI_*
+        $envFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'kongono-env-r4-' . bin2hex(random_bytes(5)) . '.env';
+        file_put_contents($envFile, "HTTPS_PROXY=http://evil:8080\nCURL_CA_BUNDLE=/tmp/evil.pem\nPHPRC=/tmp\nPATH=/evil\nPHP_INI_FOO=1\nGOOD_R4=ok\n");
+        try {
+            $loaded = EnvLoader::load($envFile, overwrite: true);
+            self::assertSame(['GOOD_R4' => 'ok'], $loaded);
+        } finally {
+            unset($_ENV['GOOD_R4'], $_SERVER['GOOD_R4']);
+            @unlink($envFile);
+        }
+    }
 }

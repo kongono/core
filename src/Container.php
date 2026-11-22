@@ -102,6 +102,19 @@ final class Container implements ContainerInterface
 
     public function get(string $id): mixed
     {
+        // Prevent persistent-runtime cross-request/cross-tenant state leaks: a singleton MUST NEVER capture a scoped service
+        if ('scoped' === ($this->lifetimes[$id] ?? null)) {
+            foreach (array_keys($this->resolving) as $ancestor) {
+                if ('singleton' === ($this->lifetimes[$ancestor] ?? null)) {
+                    throw new ContainerException(sprintf(
+                        'Captive scoped dependency rejected: singleton "%s" cannot capture per-scope service "%s".',
+                        $ancestor,
+                        $id,
+                    ));
+                }
+            }
+        }
+
         if (array_key_exists($id, $this->singletons)) {
             return $this->singletons[$id];
         }

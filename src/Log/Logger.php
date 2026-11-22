@@ -55,7 +55,7 @@ final class Logger extends AbstractLogger
 
         $safeContext = $this->scrubContext($context);
         $interpolated = SecretScrubber::scrub($this->interpolate((string) $message, $safeContext));
-        $sanitizedMessage = (string) preg_replace('/\x1b\[[0-9;]*[A-Za-z]/', '', $interpolated);
+        $sanitizedMessage = self::stripAnsi($interpolated);
 
         $record = [
             'timestamp' => gmdate(DATE_ATOM),
@@ -119,20 +119,30 @@ final class Logger extends AbstractLogger
                 continue;
             }
             if (is_string($value)) {
-                $clean[$strKey] = SecretScrubber::scrub($value);
+                $clean[$strKey] = self::stripAnsi(SecretScrubber::scrub($value));
             } elseif (is_array($value)) {
                 $clean[$strKey] = $this->scrubContext($value, $depth + 1);
+            } elseif (is_float($value) && !is_finite($value)) {
+                $clean[$strKey] = is_nan($value) ? 'NAN' : ($value > 0 ? 'INF' : '-INF');
             } elseif (is_scalar($value) || null === $value) {
                 $clean[$strKey] = $value;
             } elseif ($value instanceof \Throwable) {
-                $clean[$strKey] = sprintf('[%s] %s', $value::class, SecretScrubber::scrub($value->getMessage()));
+                $clean[$strKey] = self::stripAnsi(sprintf('[%s] %s', $value::class, SecretScrubber::scrub($value->getMessage())));
             } elseif ($value instanceof Stringable) {
-                $clean[$strKey] = SecretScrubber::scrub((string) $value);
+                $clean[$strKey] = self::stripAnsi(SecretScrubber::scrub((string) $value));
             } else {
                 $clean[$strKey] = get_debug_type($value);
             }
         }
 
         return $clean;
+    }
+
+    private static function stripAnsi(string $text): string
+    {
+        // Strip both CSI (\e[...) and OSC (\e]...\a or \e]...\e\\) terminal escape sequences
+        $noOsc = (string) preg_replace('/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)/', '', $text);
+
+        return (string) preg_replace('/\x1b\[[0-9;?]*[ -\/]*[@-~]/', '', $noOsc);
     }
 }

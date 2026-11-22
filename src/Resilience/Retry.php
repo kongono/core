@@ -27,8 +27,10 @@ final class Retry
         int $baseDelayMs = 100,
         ?Closure $shouldRetry = null,
         ?Closure $sleeper = null,
+        int $maxDelayMs = 30_000,
     ): mixed {
         $attempt = 0;
+        $cap = max(0, $maxDelayMs);
         while (true) {
             ++$attempt;
 
@@ -39,7 +41,9 @@ final class Retry
                     throw $e;
                 }
 
-                $delayMs = $baseDelayMs * (2 ** ($attempt - 1));
+                $shift = min(30, max(0, $attempt - 1));
+                $rawDelay = $baseDelayMs > 0 ? (int) min((float) PHP_INT_MAX, (float) $baseDelayMs * (float) (1 << $shift)) : 0;
+                $delayMs = $cap > 0 ? min($cap, $rawDelay) : $rawDelay;
                 if (null !== $sleeper) {
                     $sleeper($delayMs);
                 } elseif ($delayMs > 0) {

@@ -77,10 +77,17 @@ final readonly class RedisCache implements AtomicCacheInterface
 
     public function clear(): void
     {
-        $keys = $this->redis->keys($this->prefix . '*');
-        if ([] !== $keys) {
-            $this->redis->del(...$keys);
-        }
+        // Non-blocking SCAN with glob-escaped prefix prevents Redis event-loop freezes & cross-prefix wildcard deletion
+        $escapedPrefix = str_replace(['\\', '*', '?', '[', ']'], ['\\\\', '\\*', '\\?', '\\[', '\\]'], $this->prefix);
+        $cursor = '0';
+        $iterations = 0;
+        do {
+            [$cursor, $batch] = $this->redis->scan($cursor, $escapedPrefix . '*', 500);
+            if ([] !== $batch) {
+                $this->redis->del(...$batch);
+            }
+            ++$iterations;
+        } while ('0' !== $cursor && $iterations < 10_000);
     }
 
     public function remember(string $key, int $ttlSeconds, Closure $compute): mixed

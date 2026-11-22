@@ -15,7 +15,8 @@ final readonly class FileCache implements AtomicCacheInterface
 
     public function __construct(string $directory)
     {
-        if (is_link($directory)) {
+        $cleanDir = rtrim($directory, '/\\');
+        if ('' !== $cleanDir && is_link($cleanDir)) {
             throw new CoreException(sprintf('Cache directory "%s" cannot be a symbolic link.', $directory));
         }
         if (!is_dir($directory) && !@mkdir($directory, 0o700, true) && !is_dir($directory)) {
@@ -31,20 +32,22 @@ final readonly class FileCache implements AtomicCacheInterface
     public function get(string $key, mixed $default = null): mixed
     {
         $file = $this->path($key);
-        $entry = $this->readEntry($file);
+        $entry = $this->readEntry($file, unlinkExpired: false);
 
         return null === $entry ? $default : $entry['value'];
     }
 
     public function set(string $key, mixed $value, int $ttlSeconds = 300): void
     {
-        $this->writeEntry($this->path($key), $value, time() + max(1, $ttlSeconds));
+        $this->withLock($key, function (string $file) use ($value, $ttlSeconds): void {
+            $this->writeEntry($file, $value, time() + max(1, $ttlSeconds));
+        });
     }
 
     public function add(string $key, mixed $value, int $ttlSeconds = 300): bool
     {
         return $this->withLock($key, function (string $file) use ($value, $ttlSeconds): bool {
-            if (null !== $this->readEntry($file)) {
+            if (null !== $this->readEntry($file, unlinkExpired: true)) {
                 return false;
             }
             $this->writeEntry($file, $value, time() + max(1, $ttlSeconds));
@@ -56,7 +59,7 @@ final readonly class FileCache implements AtomicCacheInterface
     public function increment(string $key, int $delta = 1, int $ttlSeconds = 300): int
     {
         return $this->withLock($key, function (string $file) use ($delta, $ttlSeconds): int {
-            $entry = $this->readEntry($file);
+            $entry = $this->readEntry($file, unlinkExpired: true);
             if (null !== $entry) {
                 $current = is_int($entry['value']) ? $entry['value'] : 0;
                 $next = $current + $delta;
@@ -74,7 +77,7 @@ final readonly class FileCache implements AtomicCacheInterface
     public function pull(string $key, mixed $default = null): mixed
     {
         return $this->withLock($key, function (string $file) use ($default): mixed {
-            $entry = $this->readEntry($file);
+            $entry = $this->readEntry($file, unlinkExpired: true);
             if (!is_link($file) && is_file($file)) {
                 @unlink($file);
             }
@@ -92,23 +95,23 @@ final readonly class FileCache implements AtomicCacheInterface
 
     public function delete(string $key): void
     {
-        $file = $this->path($key);
-        if (!is_link($file) && is_file($file)) {
-            @unlink($file);
-        }
+        $this->withLock($key, static function (string $file): void {
+            if (!is_link($file) && is_file($file)) {
+                @unlink($file);
+            }
+        });
     }
 
     public function clear(): void
     {
-        foreach (['*.cache.json', '*.cache.json.lock'] as $pattern) {
-            $files = glob($this->dir . DIRECTORY_SEPARATOR . $pattern);
-            if (false === $files) {
-                continue;
-            }
-            foreach ($files as $file) {
-                if (!is_link($file) && is_file($file)) {
-                    @unlink($file);
-                }
+        // Only remove data files — never unlink active striped lock pool files
+        $files = glob($this->dir . DIRECTORY_SEPARATOR . '*.cache.json');
+        if (false === $files) {
+            return;
+        }
+        foreach ($files as $file) {
+            if (!is_link($file) && is_file($file)) {
+                @unlink($file);
             }
         }
     }
@@ -132,7 +135,7 @@ final readonly class FileCache implements AtomicCacheInterface
     }
 
     /** @return array{expires_at: int, value: mixed}|null */
-    private function readEntry(string $file): ?array
+    private function readEntry(string $file, bool $unlinkExpired): ?array
     {
         if (is_link($file) || !is_file($file)) {
             return null;
@@ -144,17 +147,23 @@ final readonly class FileCache implements AtomicCacheInterface
         try {
             $decoded = json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
         } catch (JsonException) {
-            @unlink($file);
+            if ($unlinkExpired) {
+                @unlink($file);
+            }
 
             return null;
         }
         if (!is_array($decoded) || !is_int($decoded['expires_at'] ?? null) || !array_key_exists('value', $decoded)) {
-            @unlink($file);
+            if ($unlinkExpired) {
+                @unlink($file);
+            }
 
             return null;
         }
         if ($decoded['expires_at'] <= time()) {
-            @unlink($file);
+            if ($unlinkExpired) {
+                @unlink($file);
+            }
 
             return null;
         }
@@ -188,8 +197,13 @@ final readonly class FileCache implements AtomicCacheInterface
             if (false === $written || $written !== strlen($payload)) {
                 throw new CoreException('Failed to write cache entry.');
             }
-        } finally {
             fclose($handle);
+        } catch (\Throwable $e) {
+            if (is_resource($handle)) {
+                fclose($handle);
+            }
+            @unlink($tmp);
+            throw $e;
         }
 
         if (!@rename($tmp, $file)) {
@@ -202,14 +216,18 @@ final readonly class FileCache implements AtomicCacheInterface
     }
 
     /**
+     * Fixed 256-shard flock pool prevents unbounded per-key lock-file inode exhaustion
+     * while preserving strict mutual exclusion even across clear().
+     *
      * @template T
      * @param Closure(string): T $fn
      * @return T
      */
     private function withLock(string $key, Closure $fn): mixed
     {
-        $file = $this->path($key);
-        $lockFile = $file . '.lock';
+        $hash = hash('sha256', $key);
+        $file = $this->dir . DIRECTORY_SEPARATOR . $hash . '.cache.json';
+        $lockFile = $this->dir . DIRECTORY_SEPARATOR . 'shard-' . substr($hash, 0, 2) . '.lock';
         if (is_link($lockFile)) {
             throw new CoreException('Refusing to open symbolic link cache lock.');
         }

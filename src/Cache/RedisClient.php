@@ -39,9 +39,7 @@ final class RedisClient
         float $timeout = 3.0,
         ?string $username = null,
     ): self {
-        if ('' === trim($host) || 1 === preg_match('/[\s\r\n\0]/', $host)) {
-            throw new CoreException('Unsafe Redis host rejected.');
-        }
+        $cleanHost = self::validateSocketHost($host);
         if ($port < 1 || $port > 65535) {
             throw new CoreException(sprintf('Invalid Redis port %d.', $port));
         }
@@ -49,19 +47,20 @@ final class RedisClient
         $scheme = $tls ? 'tls' : 'tcp';
         $errno = 0;
         $errstr = '';
+        $peerName = trim($cleanHost, '[]');
         $context = $tls
             ? stream_context_create([
                 'ssl' => [
                     'verify_peer' => true,
                     'verify_peer_name' => true,
                     'allow_self_signed' => false,
-                    'peer_name' => $host,
+                    'peer_name' => $peerName,
                     'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
                 ],
             ])
             : stream_context_create();
         $stream = @stream_socket_client(
-            sprintf('%s://%s:%d', $scheme, $host, $port),
+            sprintf('%s://%s:%d', $scheme, $cleanHost, $port),
             $errno,
             $errstr,
             $timeout,
@@ -363,7 +362,39 @@ LUA;
         $this->stream = null;
     }
 
-    private function readReply(int $depth = 0): mixed
+    /**
+     * Non-blocking iterative SCAN cursor query.
+     *
+     * @return array{0: string, 1: list<string>}
+     */
+    public function scan(string $cursor, ?string $match = null, int $count = 500): array
+    {
+        $args = [$cursor];
+        if (null !== $match) {
+            $args[] = 'MATCH';
+            $args[] = $match;
+        }
+        $args[] = 'COUNT';
+        $args[] = (string) max(1, $count);
+
+        $reply = $this->command('SCAN', ...$args);
+        if (!is_array($reply) || count($reply) < 2) {
+            return ['0', []];
+        }
+        $nextCursor = is_scalar($reply[0] ?? null) ? (string) $reply[0] : '0';
+        $keys = [];
+        if (is_array($reply[1] ?? null)) {
+            foreach ($reply[1] as $item) {
+                if (is_string($item)) {
+                    $keys[] = $item;
+                }
+            }
+        }
+
+        return [$nextCursor, $keys];
+    }
+
+    private function readReply(int $depth = 0, int &$totalElements = 0, int &$totalBytes = 0): mixed
     {
         if ($depth > self::MAX_NESTING_DEPTH) {
             $this->close();
@@ -383,18 +414,24 @@ LUA;
             throw new CoreException('Redis RESP reply line exceeded maximum length or ended prematurely.');
         }
 
+        $totalBytes += strlen($line);
+        if ($totalBytes > self::MAX_BULK_BYTES * 2) {
+            $this->close();
+            throw new CoreException('Redis RESP cumulative reply size exceeded maximum bound.');
+        }
+
         $prefix = $line[0];
         $payload = rtrim(substr($line, 1), "\r\n");
 
         return match ($prefix) {
             '+' => $payload,
             '-' => throw new CoreException('Redis error: ' . $payload),
-            ':' => (int) $payload,
+            ':' => $this->parseRespInt($payload),
             '_' => null,
             '#' => 't' === $payload,
             ',' => (float) $payload,
-            '$' => $this->readBulkString((int) $payload),
-            '*' => $this->readArray((int) $payload, $depth),
+            '$' => $this->readBulkString($this->parseRespInt($payload), $totalBytes),
+            '*' => $this->readArray($this->parseRespInt($payload), $depth, $totalElements, $totalBytes),
             default => (function () use ($prefix): never {
                 $this->close();
                 throw new CoreException(sprintf('Unsupported Redis RESP prefix "%s".', $prefix));
@@ -402,7 +439,17 @@ LUA;
         };
     }
 
-    private function readBulkString(int $length): ?string
+    private function parseRespInt(string $payload): int
+    {
+        if (1 !== preg_match('/\A-?\d+\z/', $payload)) {
+            $this->close();
+            throw new CoreException('Malformed non-numeric Redis RESP integer payload.');
+        }
+
+        return (int) $payload;
+    }
+
+    private function readBulkString(int $length, int &$totalBytes): ?string
     {
         if ($length < 0) {
             return null;
@@ -410,6 +457,11 @@ LUA;
         if ($length > self::MAX_BULK_BYTES) {
             $this->close();
             throw new CoreException(sprintf('Redis bulk string size %d exceeds maximum bound of %d bytes.', $length, self::MAX_BULK_BYTES));
+        }
+        $totalBytes += $length + 2;
+        if ($totalBytes > self::MAX_BULK_BYTES * 2) {
+            $this->close();
+            throw new CoreException('Redis RESP cumulative reply size exceeded maximum bound.');
         }
         if (!is_resource($this->stream)) {
             throw new CoreException('Redis connection is closed.');
@@ -427,11 +479,16 @@ LUA;
             $remaining -= strlen($chunk);
         }
 
+        if ("\r\n" !== substr($buf, $length, 2)) {
+            $this->close();
+            throw new CoreException('Malformed Redis bulk string terminator (missing CRLF).');
+        }
+
         return substr($buf, 0, $length);
     }
 
     /** @return list<mixed>|null */
-    private function readArray(int $count, int $depth = 0): ?array
+    private function readArray(int $count, int $depth, int &$totalElements, int &$totalBytes): ?array
     {
         if ($count < 0) {
             return null;
@@ -440,11 +497,46 @@ LUA;
             $this->close();
             throw new CoreException(sprintf('Redis array length %d exceeds maximum bound of %d elements.', $count, self::MAX_ARRAY_ELEMENTS));
         }
+        $totalElements += $count;
+        if ($totalElements > self::MAX_ARRAY_ELEMENTS) {
+            $this->close();
+            throw new CoreException('Redis cumulative nested array element count exceeded maximum bound.');
+        }
         $items = [];
         for ($i = 0; $i < $count; ++$i) {
-            $items[] = $this->readReply($depth + 1);
+            $items[] = $this->readReply($depth + 1, $totalElements, $totalBytes);
         }
 
         return $items;
+    }
+
+    private static function validateSocketHost(string $host): string
+    {
+        if (false !== strpbrk($host, "\r\n\0")) {
+            throw new CoreException('Unsafe Redis host rejected.');
+        }
+        $trimmed = trim($host);
+        if ('' === $trimmed || strlen($trimmed) > 255 || false !== strpbrk($trimmed, " \t/?#@%\\")) {
+            throw new CoreException('Unsafe Redis host rejected.');
+        }
+        if (str_starts_with($trimmed, '[') && str_ends_with($trimmed, ']')) {
+            $inner = substr($trimmed, 1, -1);
+            if (false === filter_var($inner, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                throw new CoreException('Invalid bracketed IPv6 Redis host.');
+            }
+
+            return '[' . strtolower($inner) . ']';
+        }
+        if (false !== filter_var($trimmed, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return '[' . strtolower($trimmed) . ']';
+        }
+        if (false !== filter_var($trimmed, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return $trimmed;
+        }
+        if (1 !== preg_match('/\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\z/', $trimmed)) {
+            throw new CoreException('Unsafe Redis host rejected.');
+        }
+
+        return $trimmed;
     }
 }

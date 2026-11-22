@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Kongono\Core\Telemetry;
 
+use Kongono\Core\CoreException;
+
 /**
  * Lightweight, zero-dependency, persistent-runtime-safe metrics registry
- * with native Prometheus text exposition format (`/metrics`).
+ * with bounded cardinality and hardened Prometheus text exposition format (`/metrics`).
  */
 final class Metrics
 {
@@ -19,11 +21,20 @@ final class Metrics
     /** @var array<string, array{name: string, labels: array<string, string>, count: int, sum: float, max: float}> */
     private array $timings = [];
 
+    /** @param positive-int $maxSeries Maximum tracked series per metric kind (prevents worker OOM) */
+    public function __construct(
+        private readonly int $maxSeries = 4096,
+    ) {}
+
     /** @param array<string, string> $labels */
     public function increment(string $name, array $labels = [], float $by = 1.0): void
     {
+        self::assertValidMetric($name, $labels);
         $key = $this->seriesKey($name, $labels);
         if (!isset($this->counters[$key])) {
+            if (count($this->counters) >= $this->maxSeries) {
+                return;
+            }
             $this->counters[$key] = ['name' => $name, 'labels' => $labels, 'value' => 0.0];
         }
         $this->counters[$key]['value'] += $by;
@@ -32,15 +43,23 @@ final class Metrics
     /** @param array<string, string> $labels */
     public function gauge(string $name, float $value, array $labels = []): void
     {
+        self::assertValidMetric($name, $labels);
         $key = $this->seriesKey($name, $labels);
+        if (!isset($this->gauges[$key]) && count($this->gauges) >= $this->maxSeries) {
+            return;
+        }
         $this->gauges[$key] = ['name' => $name, 'labels' => $labels, 'value' => $value];
     }
 
     /** @param array<string, string> $labels */
     public function observe(string $name, float $value, array $labels = []): void
     {
+        self::assertValidMetric($name, $labels);
         $key = $this->seriesKey($name, $labels);
         if (!isset($this->timings[$key])) {
+            if (count($this->timings) >= $this->maxSeries) {
+                return;
+            }
             $this->timings[$key] = ['name' => $name, 'labels' => $labels, 'count' => 0, 'sum' => 0.0, 'max' => $value];
         }
         ++$this->timings[$key]['count'];
@@ -48,6 +67,13 @@ final class Metrics
         if ($value > $this->timings[$key]['max']) {
             $this->timings[$key]['max'] = $value;
         }
+    }
+
+    public function reset(): void
+    {
+        $this->counters = [];
+        $this->gauges = [];
+        $this->timings = [];
     }
 
     /** @param array<string, string> $labels */
@@ -87,6 +113,19 @@ final class Metrics
     }
 
     /** @param array<string, string> $labels */
+    private static function assertValidMetric(string $name, array $labels): void
+    {
+        if (1 !== preg_match('/\A[a-zA-Z_:][a-zA-Z0-9_:]*\z/', $name)) {
+            throw new CoreException(sprintf('Invalid Prometheus metric name "%s".', $name));
+        }
+        foreach (array_keys($labels) as $labelName) {
+            if (1 !== preg_match('/\A[a-zA-Z_][a-zA-Z0-9_]*\z/', $labelName)) {
+                throw new CoreException(sprintf('Invalid Prometheus label name "%s".', $labelName));
+            }
+        }
+    }
+
+    /** @param array<string, string> $labels */
     private function formatLabels(array $labels): string
     {
         if ([] === $labels) {
@@ -95,7 +134,7 @@ final class Metrics
         ksort($labels);
         $parts = [];
         foreach ($labels as $k => $v) {
-            $escaped = str_replace(['\\', '"', "\n"], ['\\\\', '\\"', '\\n'], $v);
+            $escaped = str_replace(['\\', '"', "\n", "\r"], ['\\\\', '\\"', '\\n', '\\r'], $v);
             $parts[] = sprintf('%s="%s"', $k, $escaped);
         }
 

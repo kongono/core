@@ -21,6 +21,9 @@ final class FeatureManager
     private array $resolvers = [];
 
     /** @var array<string, array{value: bool, expires_at: int}> */
+    private array $globalOverrides = [];
+
+    /** @var array<string, array{value: bool, expires_at: int}> */
     private array $memoryOverrides = [];
 
     public function __construct(
@@ -117,13 +120,30 @@ final class FeatureManager
             return $this;
         }
 
+        $now = time();
+        if (null === $scopeKey) {
+            // Keep global kill-switches isolated so high-cardinality per-scope overrides can NEVER evict them
+            $this->globalOverrides[$key] = [
+                'value' => $value,
+                'expires_at' => $now + $ttl,
+            ];
+
+            return $this;
+        }
+
         if (!isset($this->memoryOverrides[$key]) && count($this->memoryOverrides) >= self::MAX_MEMORY_OVERRIDES) {
-            $oldest = array_key_first($this->memoryOverrides);
-            unset($this->memoryOverrides[$oldest]);
+            foreach ($this->memoryOverrides as $k => $entry) {
+                if ($entry['expires_at'] <= $now) {
+                    unset($this->memoryOverrides[$k]);
+                }
+            }
+            if (count($this->memoryOverrides) >= self::MAX_MEMORY_OVERRIDES) {
+                unset($this->memoryOverrides[array_key_first($this->memoryOverrides)]);
+            }
         }
         $this->memoryOverrides[$key] = [
             'value' => $value,
-            'expires_at' => time() + $ttl,
+            'expires_at' => $now + $ttl,
         ];
 
         return $this;
@@ -136,6 +156,19 @@ final class FeatureManager
             $cached = $this->cache->get($key);
 
             return is_bool($cached) ? $cached : null;
+        }
+
+        if (null === $scopeKey) {
+            if (!isset($this->globalOverrides[$key])) {
+                return null;
+            }
+            if ($this->globalOverrides[$key]['expires_at'] <= time()) {
+                unset($this->globalOverrides[$key]);
+
+                return null;
+            }
+
+            return $this->globalOverrides[$key]['value'];
         }
 
         if (!isset($this->memoryOverrides[$key])) {
