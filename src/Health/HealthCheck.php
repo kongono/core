@@ -8,11 +8,15 @@ use Closure;
 use Kongono\Core\Diagnostics\SecretScrubber;
 use Throwable;
 
-/** Composable readiness & liveness health checker with per-check latency reporting. */
+/** Composable readiness & liveness health checker with nondisclosing error defaults and per-check latency reporting. */
 final class HealthCheck
 {
     /** @var array<string, Closure(): bool> */
     private array $checks = [];
+
+    public function __construct(
+        private readonly bool $exposeErrors = false,
+    ) {}
 
     /** @param Closure(): bool $probe Return true if healthy; throw or return false if unhealthy */
     public function check(string $name, Closure $probe): self
@@ -32,8 +36,9 @@ final class HealthCheck
      *     checks: array<string, array{ok: bool, duration_ms: float, error?: string}>
      * }
      */
-    public function run(): array
+    public function run(?bool $exposeErrors = null): array
     {
+        $reveal = $exposeErrors ?? $this->exposeErrors;
         $allHealthy = true;
         $results = [];
 
@@ -52,7 +57,7 @@ final class HealthCheck
                 $results[$name] = [
                     'ok' => false,
                     'duration_ms' => $durationMs,
-                    'error' => SecretScrubber::scrub($e->getMessage()),
+                    'error' => $reveal ? SecretScrubber::scrub($e->getMessage()) : 'Health check failed.',
                 ];
             }
         }

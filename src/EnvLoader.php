@@ -7,12 +7,32 @@ namespace Kongono\Core;
 /** Strict, zero-dependency .env file loader (never overwrites existing environment variables by default). */
 final class EnvLoader
 {
+    /** @var list<string> */
+    private const array FORBIDDEN_KEYS = [
+        'REMOTE_ADDR',
+        'REMOTE_HOST',
+        'REMOTE_PORT',
+        'HTTPS',
+        'REQUEST_URI',
+        'REQUEST_METHOD',
+        'SCRIPT_FILENAME',
+        'SCRIPT_NAME',
+        'DOCUMENT_ROOT',
+        'SERVER_NAME',
+        'SERVER_ADDR',
+        'SERVER_PORT',
+        'LD_PRELOAD',
+        'LD_LIBRARY_PATH',
+        'PHP_INI_SCAN_DIR',
+        'OPENSSL_CONF',
+    ];
+
     /**
      * Load key=value pairs from a .env file into $_ENV and $_SERVER.
      *
      * @return array<string, string> Loaded variables
      */
-    public static function load(string $filePath, bool $overwrite = false): array
+    public static function load(string $filePath, bool $overwrite = false, bool $populatePutenv = false): array
     {
         if (!is_file($filePath)) {
             return [];
@@ -41,16 +61,27 @@ final class EnvLoader
                 continue;
             }
 
-            $rawValue = trim(substr($trimmed, $pos + 1));
-            $value = self::parseValue($rawValue);
+            $upperKey = strtoupper($key);
+            if (
+                in_array($upperKey, self::FORBIDDEN_KEYS, true)
+                || str_starts_with($upperKey, 'HTTP_')
+                || str_starts_with($upperKey, 'DYLD_')
+            ) {
+                continue;
+            }
 
-            if (!$overwrite && (array_key_exists($key, $_ENV) || false !== getenv($key))) {
+            $rawValue = trim(substr($trimmed, $pos + 1));
+            $value = str_replace("\0", '', self::parseValue($rawValue));
+
+            if (!$overwrite && (array_key_exists($key, $_ENV) || array_key_exists($key, $_SERVER) || false !== getenv($key))) {
                 continue;
             }
 
             $_ENV[$key] = $value;
             $_SERVER[$key] = $value;
-            putenv($key . '=' . $value);
+            if ($populatePutenv) {
+                putenv($key . '=' . $value);
+            }
             $loaded[$key] = $value;
         }
 

@@ -18,6 +18,7 @@ final class RedisClient
     private const int MAX_BULK_BYTES = 16_777_216;
     private const int MAX_ARRAY_ELEMENTS = 100_000;
     private const int MAX_NESTING_DEPTH = 16;
+    private const int MAX_LINE_BYTES = 65_536;
 
     /** @var resource|null */
     private mixed $stream;
@@ -38,6 +39,13 @@ final class RedisClient
         float $timeout = 3.0,
         ?string $username = null,
     ): self {
+        if ('' === trim($host) || 1 === preg_match('/[\s\r\n\0]/', $host)) {
+            throw new CoreException('Unsafe Redis host rejected.');
+        }
+        if ($port < 1 || $port > 65535) {
+            throw new CoreException(sprintf('Invalid Redis port %d.', $port));
+        }
+
         $scheme = $tls ? 'tls' : 'tcp';
         $errno = 0;
         $errstr = '';
@@ -137,8 +145,9 @@ final class RedisClient
         $total = strlen($wire);
         $written = 0;
         while ($written < $total) {
-            $n = fwrite($this->stream, substr($wire, $written));
+            $n = @fwrite($this->stream, substr($wire, $written));
             if (false === $n || 0 === $n) {
+                $this->close();
                 throw new CoreException('Failed writing command to Redis stream.');
             }
             $written += $n;
@@ -168,6 +177,48 @@ final class RedisClient
         } else {
             $this->command('SET', $key, $value);
         }
+    }
+
+    /** Atomically set a key only when it does not already exist. */
+    public function setNx(string $key, string $value, int $ttlSeconds = 300): bool
+    {
+        $reply = $this->command('SET', $key, $value, 'EX', (string) max(1, $ttlSeconds), 'NX');
+
+        return 'OK' === $reply;
+    }
+
+    /** Atomically retrieve and delete a key (Redis 6.2+ / Valkey). */
+    public function getDel(string $key): ?string
+    {
+        $reply = $this->command('GETDEL', $key);
+
+        return is_string($reply) ? $reply : null;
+    }
+
+    /**
+     * Evaluate a Redis Lua script atomically.
+     *
+     * @param list<string> $keys
+     * @param list<string> $args
+     */
+    public function eval(string $script, array $keys = [], array $args = []): mixed
+    {
+        return $this->command('EVAL', $script, (string) count($keys), ...$keys, ...$args);
+    }
+
+    /** Atomically increment a counter and initialize its TTL on creation (single round-trip Lua). */
+    public function incrByWithTtl(string $key, int $delta = 1, int $ttlSeconds = 300): int
+    {
+        $script = <<<'LUA'
+local v = redis.call('INCRBY', KEYS[1], tonumber(ARGV[1]))
+if v == tonumber(ARGV[1]) or redis.call('TTL', KEYS[1]) < 0 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return v
+LUA;
+        $reply = $this->eval($script, [$key], [(string) $delta, (string) max(1, $ttlSeconds)]);
+
+        return is_int($reply) ? $reply : 0;
     }
 
     public function del(string ...$keys): int
@@ -315,15 +366,21 @@ final class RedisClient
     private function readReply(int $depth = 0): mixed
     {
         if ($depth > self::MAX_NESTING_DEPTH) {
+            $this->close();
             throw new CoreException('Redis RESP nesting depth exceeded maximum limit.');
         }
         if (!is_resource($this->stream)) {
             throw new CoreException('Redis connection is closed.');
         }
 
-        $line = fgets($this->stream);
+        $line = @fgets($this->stream, self::MAX_LINE_BYTES + 1);
         if (false === $line || '' === $line) {
+            $this->close();
             throw new CoreException('Unexpected EOF while reading Redis reply.');
+        }
+        if (!str_ends_with($line, "\n")) {
+            $this->close();
+            throw new CoreException('Redis RESP reply line exceeded maximum length or ended prematurely.');
         }
 
         $prefix = $line[0];
@@ -338,7 +395,10 @@ final class RedisClient
             ',' => (float) $payload,
             '$' => $this->readBulkString((int) $payload),
             '*' => $this->readArray((int) $payload, $depth),
-            default => throw new CoreException(sprintf('Unsupported Redis RESP prefix "%s".', $prefix)),
+            default => (function () use ($prefix): never {
+                $this->close();
+                throw new CoreException(sprintf('Unsupported Redis RESP prefix "%s".', $prefix));
+            })(),
         };
     }
 
@@ -348,6 +408,7 @@ final class RedisClient
             return null;
         }
         if ($length > self::MAX_BULK_BYTES) {
+            $this->close();
             throw new CoreException(sprintf('Redis bulk string size %d exceeds maximum bound of %d bytes.', $length, self::MAX_BULK_BYTES));
         }
         if (!is_resource($this->stream)) {
@@ -357,8 +418,9 @@ final class RedisClient
         $remaining = $length + 2; // payload + trailing CRLF
         $buf = '';
         while ($remaining > 0) {
-            $chunk = fread($this->stream, $remaining);
+            $chunk = @fread($this->stream, $remaining);
             if (false === $chunk || '' === $chunk) {
+                $this->close();
                 throw new CoreException('Unexpected EOF while reading Redis bulk string.');
             }
             $buf .= $chunk;
@@ -375,6 +437,7 @@ final class RedisClient
             return null;
         }
         if ($count > self::MAX_ARRAY_ELEMENTS) {
+            $this->close();
             throw new CoreException(sprintf('Redis array length %d exceeds maximum bound of %d elements.', $count, self::MAX_ARRAY_ELEMENTS));
         }
         $items = [];

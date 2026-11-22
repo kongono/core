@@ -38,8 +38,8 @@ final readonly class Diagnostic
     {
         return [
             'id' => $this->id,
-            'title' => $this->title,
-            'remediation' => $this->remediation,
+            'title' => SecretScrubber::scrub($this->title),
+            'remediation' => SecretScrubber::scrub($this->remediation),
             'fields' => $this->safeFields(),
         ];
     }

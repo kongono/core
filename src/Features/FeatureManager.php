@@ -15,10 +15,12 @@ use Kongono\Core\Cache\CacheInterface;
  */
 final class FeatureManager
 {
+    private const int MAX_MEMORY_OVERRIDES = 2048;
+
     /** @var array<string, Closure(?string): bool> */
     private array $resolvers = [];
 
-    /** @var array<string, bool> */
+    /** @var array<string, array{value: bool, expires_at: int}> */
     private array $memoryOverrides = [];
 
     public function __construct(
@@ -108,8 +110,21 @@ final class FeatureManager
     private function setOverride(string $feature, ?string $scopeKey, bool $value, int $ttlSeconds): self
     {
         $key = $this->overrideKey($feature, $scopeKey);
-        $this->memoryOverrides[$key] = $value;
-        $this->cache?->set($key, $value, $ttlSeconds);
+        $ttl = max(1, $ttlSeconds);
+        if (null !== $this->cache) {
+            $this->cache->set($key, $value, $ttl);
+
+            return $this;
+        }
+
+        if (!isset($this->memoryOverrides[$key]) && count($this->memoryOverrides) >= self::MAX_MEMORY_OVERRIDES) {
+            $oldest = array_key_first($this->memoryOverrides);
+            unset($this->memoryOverrides[$oldest]);
+        }
+        $this->memoryOverrides[$key] = [
+            'value' => $value,
+            'expires_at' => time() + $ttl,
+        ];
 
         return $this;
     }
@@ -117,16 +132,30 @@ final class FeatureManager
     private function getOverride(string $feature, ?string $scopeKey): ?bool
     {
         $key = $this->overrideKey($feature, $scopeKey);
-        if (array_key_exists($key, $this->memoryOverrides)) {
-            return $this->memoryOverrides[$key];
-        }
-        $cached = $this->cache?->get($key);
+        if (null !== $this->cache) {
+            $cached = $this->cache->get($key);
 
-        return is_bool($cached) ? $cached : null;
+            return is_bool($cached) ? $cached : null;
+        }
+
+        if (!isset($this->memoryOverrides[$key])) {
+            return null;
+        }
+        if ($this->memoryOverrides[$key]['expires_at'] <= time()) {
+            unset($this->memoryOverrides[$key]);
+
+            return null;
+        }
+
+        return $this->memoryOverrides[$key]['value'];
     }
 
     private function overrideKey(string $feature, ?string $scopeKey): string
     {
-        return $this->cachePrefix . $feature . ':' . ($scopeKey ?? '__global__');
+        if (null === $scopeKey) {
+            return $this->cachePrefix . 'global:' . hash('sha256', $feature);
+        }
+
+        return $this->cachePrefix . 'scoped:' . hash('sha256', $feature . "\0" . $scopeKey);
     }
 }

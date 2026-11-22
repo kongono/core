@@ -53,14 +53,15 @@ final class Logger extends AbstractLogger
             return;
         }
 
-        $interpolated = SecretScrubber::scrub($this->interpolate((string) $message, $context));
         $safeContext = $this->scrubContext($context);
+        $interpolated = SecretScrubber::scrub($this->interpolate((string) $message, $safeContext));
+        $sanitizedMessage = (string) preg_replace('/\x1b\[[0-9;]*[A-Za-z]/', '', $interpolated);
 
         $record = [
             'timestamp' => gmdate(DATE_ATOM),
             'level' => $levelStr,
             'channel' => $this->channel,
-            'message' => $interpolated,
+            'message' => $sanitizedMessage,
             'context' => $safeContext,
         ];
 
@@ -69,7 +70,10 @@ final class Logger extends AbstractLogger
         }
 
         if (is_resource($this->stream)) {
-            fwrite($this->stream, json_encode($record, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n");
+            fwrite(
+                $this->stream,
+                json_encode($record, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) . "\n",
+            );
         }
     }
 
@@ -101,21 +105,29 @@ final class Logger extends AbstractLogger
      * @param array<array-key, mixed> $context
      * @return array<string, mixed>
      */
-    private function scrubContext(array $context): array
+    private function scrubContext(array $context, int $depth = 0): array
     {
+        if ($depth >= 16) {
+            return ['_truncated' => '[MAX_DEPTH]'];
+        }
+
         $clean = [];
         foreach ($context as $key => $value) {
             $strKey = (string) $key;
-            if (1 === preg_match('/password|secret|token|authorization|api_?key/i', $strKey)) {
+            if (SecretScrubber::isSensitiveKey($strKey)) {
                 $clean[$strKey] = '[REDACTED]';
                 continue;
             }
             if (is_string($value)) {
                 $clean[$strKey] = SecretScrubber::scrub($value);
             } elseif (is_array($value)) {
-                $clean[$strKey] = $this->scrubContext($value);
+                $clean[$strKey] = $this->scrubContext($value, $depth + 1);
             } elseif (is_scalar($value) || null === $value) {
                 $clean[$strKey] = $value;
+            } elseif ($value instanceof \Throwable) {
+                $clean[$strKey] = sprintf('[%s] %s', $value::class, SecretScrubber::scrub($value->getMessage()));
+            } elseif ($value instanceof Stringable) {
+                $clean[$strKey] = SecretScrubber::scrub((string) $value);
             } else {
                 $clean[$strKey] = get_debug_type($value);
             }

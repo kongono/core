@@ -12,7 +12,7 @@ use JsonException;
  *
  * Works seamlessly with `CacheSessionStore` and `RateLimitMiddleware` for multi-node scaling.
  */
-final readonly class RedisCache implements CacheInterface
+final readonly class RedisCache implements AtomicCacheInterface
 {
     public function __construct(
         private RedisClient $redis,
@@ -37,6 +37,32 @@ final readonly class RedisCache implements CacheInterface
     {
         $encoded = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         $this->redis->set($this->prefixed($key), $encoded, max(1, $ttlSeconds));
+    }
+
+    public function add(string $key, mixed $value, int $ttlSeconds = 300): bool
+    {
+        $encoded = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+
+        return $this->redis->setNx($this->prefixed($key), $encoded, max(1, $ttlSeconds));
+    }
+
+    public function increment(string $key, int $delta = 1, int $ttlSeconds = 300): int
+    {
+        return $this->redis->incrByWithTtl($this->prefixed($key), $delta, max(1, $ttlSeconds));
+    }
+
+    public function pull(string $key, mixed $default = null): mixed
+    {
+        $raw = $this->redis->getDel($this->prefixed($key));
+        if (null === $raw) {
+            return $default;
+        }
+
+        try {
+            return json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return $default;
+        }
     }
 
     public function has(string $key): bool

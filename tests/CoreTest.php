@@ -331,18 +331,26 @@ final class CoreTest extends TestCase
         self::assertTrue($healthy['healthy']);
         self::assertTrue($healthy['checks']['db']['ok']);
 
-        $degraded = (new HealthCheck())
+        $degradedHidden = (new HealthCheck())
             ->check('ok_probe', static fn(): bool => true)
             ->check('false_probe', static fn(): bool => false)
+            ->check('crash_probe', static function (): bool {
+                throw new CoreException('Failed auth password=supersecretvalue at 10.0.0.5:6379');
+            })
+            ->run();
+
+        self::assertSame('degraded', $degradedHidden['status']);
+        self::assertFalse($degradedHidden['healthy']);
+        self::assertFalse($degradedHidden['checks']['false_probe']['ok']);
+        self::assertFalse($degradedHidden['checks']['crash_probe']['ok']);
+        self::assertSame('Health check failed.', $degradedHidden['checks']['crash_probe']['error'] ?? null);
+
+        $degraded = (new HealthCheck(exposeErrors: true))
             ->check('crash_probe', static function (): bool {
                 throw new CoreException('Failed auth password=supersecretvalue');
             })
             ->run();
 
-        self::assertSame('degraded', $degraded['status']);
-        self::assertFalse($degraded['healthy']);
-        self::assertFalse($degraded['checks']['false_probe']['ok']);
-        self::assertFalse($degraded['checks']['crash_probe']['ok']);
         self::assertArrayHasKey('error', $degraded['checks']['crash_probe']);
         self::assertStringNotContainsString('supersecretvalue', $degraded['checks']['crash_probe']['error']);
         self::assertStringContainsString('[REDACTED]', $degraded['checks']['crash_probe']['error']);
@@ -578,8 +586,111 @@ final class CoreTest extends TestCase
             $this->expectExceptionMessage('exceeds maximum bound');
             $redis->get('boom');
         } finally {
-            fclose($serverSock);
-            fclose($clientSock);
+            if (is_resource($serverSock)) {
+                fclose($serverSock);
+            }
+            if (is_resource($clientSock)) {
+                fclose($clientSock);
+            }
+        }
+    }
+
+    public function testRound3SecretScrubberLoggerAtomicCacheFeaturesAndEnvLoaderHardening(): void
+    {
+        // 1. SecretScrubber: JSON-quoted, Basic auth, Cookie, APP_KEY, Resend, truncated PEM, camelCase, Throwable
+        $raw = 'Authorization: Basic dXNlcjpwYXNz | Cookie: sid=abc123 | {"password":"s3cr3t","apiKey":"re_9999999999999999"} | APP_KEY=base64:abcdef123456 | -----BEGIN PRIVATE KEY-----MIIEvQIBADAN';
+        $scrubbed = SecretScrubber::scrub($raw);
+        self::assertStringNotContainsString('dXNlcjpwYXNz', $scrubbed);
+        self::assertStringNotContainsString('sid=abc123', $scrubbed);
+        self::assertStringNotContainsString('s3cr3t', $scrubbed);
+        self::assertStringNotContainsString('re_9999999999999999', $scrubbed);
+        self::assertStringNotContainsString('base64:abcdef123456', $scrubbed);
+        self::assertStringNotContainsString('MIIEvQIBADAN', $scrubbed);
+
+        $scrubbedArr = SecretScrubber::scrubArray([
+            'clientSecret' => 'top-secret',
+            'nestedErr' => new CoreException('Bearer super_secret_tok_999'),
+        ]);
+        self::assertSame('[REDACTED]', $scrubbedArr['clientSecret']);
+        self::assertIsString($scrubbedArr['nestedErr']);
+        self::assertStringNotContainsString('super_secret_tok_999', $scrubbedArr['nestedErr']);
+
+        // Diagnostic::toSafeArray() scrubs title and remediation too
+        $diag = new Diagnostic('KGN-TEST', 'Failed with token=abc_secret_xyz', 'Use password=my_pass_123');
+        $safe = $diag->toSafeArray();
+        self::assertStringNotContainsString('abc_secret_xyz', $safe['title']);
+        self::assertStringNotContainsString('my_pass_123', $safe['remediation']);
+
+        // 2. Logger: redacts {password} BEFORE interpolation AND survives invalid UTF-8 bytes
+        $logBuffer = fopen('php://memory', 'r+b');
+        self::assertIsResource($logBuffer);
+        try {
+            $logger = new Logger('sec', stream: $logBuffer, retainInMemory: true);
+            $logger->warning("Auth fail for {password} with raw \xFF\xFE bytes", ['password' => 'hunter2_plain']);
+            $rec = $logger->records()[0];
+            self::assertStringNotContainsString('hunter2_plain', $rec['message']);
+            self::assertSame('[REDACTED]', $rec['context']['password']);
+            rewind($logBuffer);
+            $jsonLine = (string) stream_get_contents($logBuffer);
+            self::assertNotSame('', trim($jsonLine));
+            self::assertStringNotContainsString('hunter2_plain', $jsonLine);
+        } finally {
+            fclose($logBuffer);
+        }
+
+        // 3. HealthCheck defaults to nondisclosing generic error text
+        $health = (new HealthCheck())->check('db', static function (): bool {
+            throw new CoreException('SQLSTATE[08006]: could not connect to 10.0.0.42:5432');
+        });
+        $report = $health->run();
+        self::assertSame('degraded', $report['status']);
+        self::assertSame('Health check failed.', $report['checks']['db']['error'] ?? '');
+        self::assertStringNotContainsString('10.0.0.42', $report['checks']['db']['error'] ?? '');
+
+        // 4. AtomicCacheInterface on MemoryCache & FileCache (add, increment, pull)
+        $mem = new MemoryCache();
+        self::assertTrue($mem->add('lock:1', 'owner-a', 60));
+        self::assertFalse($mem->add('lock:1', 'owner-b', 60));
+        self::assertSame(1, $mem->increment('rate:1', 1, 60));
+        self::assertSame(2, $mem->increment('rate:1', 1, 60));
+        self::assertSame('owner-a', $mem->pull('lock:1'));
+        self::assertNull($mem->pull('lock:1'));
+
+        $cacheDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'kongono-fcache-r3-' . bin2hex(random_bytes(5));
+        try {
+            $fc = new FileCache($cacheDir);
+            self::assertTrue($fc->add('once', 'tok-1', 60));
+            self::assertFalse($fc->add('once', 'tok-2', 60));
+            self::assertSame(1, $fc->increment('hits', 1, 60));
+            self::assertSame(3, $fc->increment('hits', 2, 60));
+            self::assertSame('tok-1', $fc->pull('once'));
+            self::assertNull($fc->pull('once'));
+        } finally {
+            foreach (glob($cacheDir . DIRECTORY_SEPARATOR . '*') ?: [] as $f) {
+                @unlink($f);
+            }
+            @rmdir($cacheDir);
+        }
+
+        // 5. FeatureManager prevents `__global__` scope key collision
+        $fm = new FeatureManager();
+        $fm->define('beta', static fn(): bool => false);
+        $fm->enable('beta', '__global__');
+        self::assertFalse($fm->active('beta'));
+        self::assertTrue($fm->active('beta', '__global__'));
+
+        // 6. EnvLoader blocks dangerous SAPI/OS variables (REMOTE_ADDR, HTTP_HOST, LD_PRELOAD)
+        $envFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'kongono-env-r3-' . bin2hex(random_bytes(5)) . '.env';
+        file_put_contents($envFile, "SAFE_R3_FLAG=ok\nREMOTE_ADDR=127.0.0.1\nHTTP_HOST=evil.test\nLD_PRELOAD=/tmp/pwn.so\n");
+        try {
+            $loaded = EnvLoader::load($envFile, overwrite: true);
+            self::assertSame(['SAFE_R3_FLAG' => 'ok'], $loaded);
+            self::assertArrayNotHasKey('REMOTE_ADDR', $loaded);
+            self::assertArrayNotHasKey('HTTP_HOST', $loaded);
+            self::assertArrayNotHasKey('LD_PRELOAD', $loaded);
+        } finally {
+            unset($_ENV['SAFE_R3_FLAG'], $_SERVER['SAFE_R3_FLAG']);
+            @unlink($envFile);
         }
     }
 }
