@@ -82,6 +82,36 @@ final class Metrics
         return $this->counters[$this->seriesKey($name, $labels)]['value'] ?? 0.0;
     }
 
+    /**
+     * Return a structured snapshot of all tracked counters, gauges, and timings (ideal for OpsDashboard / JSON APIs).
+     *
+     * @return array{
+     *     counters: list<array{name: string, labels: array<string, string>, value: float}>,
+     *     gauges: list<array{name: string, labels: array<string, string>, value: float}>,
+     *     timings: list<array{name: string, labels: array<string, string>, count: int, sum: float, max: float, avg: float}>
+     * }
+     */
+    public function snapshot(): array
+    {
+        $timings = [];
+        foreach ($this->timings as $t) {
+            $timings[] = [
+                'name' => $t['name'],
+                'labels' => $t['labels'],
+                'count' => $t['count'],
+                'sum' => round($t['sum'], 4),
+                'max' => round($t['max'], 4),
+                'avg' => $t['count'] > 0 ? round($t['sum'] / $t['count'], 4) : 0.0,
+            ];
+        }
+
+        return [
+            'counters' => array_values($this->counters),
+            'gauges' => array_values($this->gauges),
+            'timings' => $timings,
+        ];
+    }
+
     /** Export all metrics in standard Prometheus text exposition format 0.0.4. */
     public function toPrometheus(): string
     {
