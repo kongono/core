@@ -9,6 +9,9 @@ use Kongono\Core\Cache\FileCache;
 use Kongono\Core\Cache\MemoryCache;
 use Kongono\Core\Cache\RedisCache;
 use Kongono\Core\Cache\RedisClient;
+use Kongono\Core\Clock\ClockInterface;
+use Kongono\Core\Clock\FrozenClock;
+use Kongono\Core\Clock\SystemClock;
 use Kongono\Core\Config;
 use Kongono\Core\Container;
 use Kongono\Core\ContainerException;
@@ -849,5 +852,32 @@ final class CoreTest extends TestCase
         } finally {
             @rmdir($tmpCacheDir);
         }
+    }
+
+    public function testSystemClockAndFrozenClockTimeTravelAndIsolation(): void
+    {
+        $sys = new SystemClock();
+        self::assertInstanceOf(ClockInterface::class, $sys);
+        self::assertSame('UTC', $sys->now()->getTimezone()->getName());
+        self::assertGreaterThan(1_700_000_000, $sys->timestamp());
+
+        $clockA = FrozenClock::at('2026-11-22 12:00:00');
+        $clockB = FrozenClock::at(1_700_000_000);
+        self::assertSame('2026-11-22T12:00:00+00:00', $clockA->now()->format(DATE_ATOM));
+        self::assertSame(1_700_000_000, $clockB->timestamp());
+
+        // Traveling on clockA has ZERO effect on clockB (instance-scoped, zero statics)
+        $clockA->advanceSeconds(30)->advanceMinutes(5)->advanceHours(2)->advanceDays(1);
+        self::assertSame('2026-11-23T14:05:30+00:00', $clockA->now()->format(DATE_ATOM));
+        self::assertSame(1_700_000_000, $clockB->timestamp());
+
+        $clockA->rewindSeconds(30);
+        self::assertSame('2026-11-23T14:05:00+00:00', $clockA->now()->format(DATE_ATOM));
+
+        $clockA->freeze('2027-01-01 00:00:00');
+        self::assertSame('2027-01-01T00:00:00+00:00', $clockA->now()->format(DATE_ATOM));
+
+        $this->expectException(CoreException::class);
+        $clockA->modify('not a valid modifier %%%');
     }
 }
