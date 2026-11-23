@@ -21,6 +21,7 @@ final class SecretScrubber
         ['/sk-(?:proj-|live_|test_)?[A-Za-z0-9_-]{16,}/', '[REDACTED]'],
         ['/(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/', '[REDACTED]'],
         ['/AIza[0-9A-Za-z_-]{20,}/', '[REDACTED]'],
+        ['/\bgsk_[A-Za-z0-9_-]{20,}\b/', '[REDACTED]'],
         ['/\bre_[A-Za-z0-9_]{16,}\b/', '[REDACTED]'],
         ['/\bgh[pousr]_[A-Za-z0-9]{20,}\b/', '[REDACTED]'],
         ['/github_pat_[A-Za-z0-9_]{20,}/', '[REDACTED]'],

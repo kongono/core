@@ -169,6 +169,10 @@ final class CoreTest extends TestCase
             SecretScrubber::scrub('STRIPE_WEBHOOK_SECRET=whsec_9f8e7d6c5b4a3210fedcba9876543210'),
         );
         self::assertSame(
+            'leaked [REDACTED] key',
+            SecretScrubber::scrub('leaked gsk_1234567890abcdefghijKLMN key'),
+        );
+        self::assertSame(
             'Authorization: Bearer [REDACTED]',
             SecretScrubber::scrub('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def'),
         );
