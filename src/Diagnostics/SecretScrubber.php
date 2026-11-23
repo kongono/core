@@ -24,6 +24,7 @@ final class SecretScrubber
         ['/\bre_[A-Za-z0-9_]{16,}\b/', '[REDACTED]'],
         ['/\bgh[pousr]_[A-Za-z0-9]{20,}\b/', '[REDACTED]'],
         ['/github_pat_[A-Za-z0-9_]{20,}/', '[REDACTED]'],
+        ['/\bkgn_pat_[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}\b/', '[REDACTED]'],
         ['/whsec_[A-Za-z0-9_-]{16,}/', '[REDACTED]'],
         ['/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/', '[REDACTED]'],
         ['/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/', '[REDACTED]'],
