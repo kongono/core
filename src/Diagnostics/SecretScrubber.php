@@ -30,17 +30,20 @@ final class SecretScrubber
         ['/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/', '[REDACTED]'],
         ['/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/', '[REDACTED]'],
         ['/(X-Amz-Signature=)[^&\s"\']+/i', '$1[REDACTED]'],
-        // Authorization headers (Bearer including ':', Basic, Digest, AWS4-HMAC-SHA256) and Cookie / Set-Cookie header lines
-        ['/Bearer\s+[A-Za-z0-9._~+:\/-]+={0,3}/i', 'Bearer [REDACTED]'],
+        ['/(X-Amz-Security-Token=)[^&\s"\']+/i', '$1[REDACTED]'],
+        // Authorization headers (Bearer including ':', '%', '=', Basic, Digest, AWS4-HMAC-SHA256) and Cookie / Set-Cookie header lines
+        ['/Bearer\s+[A-Za-z0-9._~+:\/%-]+={0,3}/i', 'Bearer [REDACTED]'],
         ['/Basic\s+[A-Za-z0-9+\/_-]+={0,3}/i', 'Basic [REDACTED]'],
         ['/(Authorization\s*:\s*(?:Digest|AWS4-HMAC-SHA256)\s+)[^\r\n]+/i', '$1[REDACTED]'],
         ['/(^|[\r\n])([ \t]*(?:set-)?cookie\s*:\s*)[^\r\n]+/im', '$1$2[REDACTED]'],
+        ['/\b((?:set-)?cookie\s*:\s*)[^\r\n]+/i', '$1[REDACTED]'],
+        ['/\b(kongono_(?:session|remember)=)[^;\s"\']+/i', '$1[REDACTED]'],
         ['/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b/', '[REDACTED_JWT]'],
-        // Quoted and JSON key-value secret assignments (bounded key prefix prevents PCRE backtrack limit DoS; consumes escaped quotes)
-        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|credential|cookie|session[_-]?id)["\']?\s*[:=]\s*)"(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^"\\\\\r\n])*+"/i', '$1"[REDACTED]"'],
-        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|credential|cookie|session[_-]?id)["\']?\s*[:=]\s*)\'(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^\'\\\\\r\n])*+\'/i', '$1\'[REDACTED]\''],
-        // Generic unquoted key=value / key: value secret assignments (bounded key prefix prevents PCRE backtrack bypass)
-        ['/(\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|cookie|session[_-]?id))(\s*[:=]\s*)(?!\[REDACTED)(?!(?:Bearer|Basic|Digest|AWS4-HMAC-SHA256)\s+\[REDACTED)[^\s,;\]"\'}]+/i', '$1$2[REDACTED]'],
+        // Quoted, JSON, and PHP array-literal (=>) key-value secret assignments (bounded key prefix prevents PCRE backtrack limit DoS; consumes escaped quotes)
+        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|credential|cookie|session[_-]?id)["\']?\s*(?:=>|[:=])\s*)"(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^"\\\\\r\n])*+"/i', '$1"[REDACTED]"'],
+        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|credential|cookie|session[_-]?id)["\']?\s*(?:=>|[:=])\s*)\'(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^\'\\\\\r\n])*+\'/i', '$1\'[REDACTED]\''],
+        // Generic unquoted key=value / key: value / key => value secret assignments (bounded key prefix prevents PCRE backtrack bypass)
+        ['/(\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|cookie|session[_-]?id))(\s*(?:=>|[:=])\s*)(?!\[REDACTED)(?!(?:Bearer|Basic|Digest|AWS4-HMAC-SHA256)\s+\[REDACTED)[^\s,;\]"\'}]+/i', '$1$2[REDACTED]'],
     ];
 
     /** @var list<string> */
@@ -49,6 +52,7 @@ final class SecretScrubber
         'passwd',
         'passphrase',
         'password_hash',
+        'password_confirmation',
         'secret',
         'secret_key',
         'secret_access_key',
@@ -60,8 +64,12 @@ final class SecretScrubber
         'access_token',
         'refresh_token',
         'csrf_token',
+        'xsrf_token',
+        'session_token',
         'auth_token',
+        '_csrf',
         'authorization',
+        'proxy_authorization',
         'private_key',
         'private_key_pem',
         'client_secret',
@@ -73,6 +81,36 @@ final class SecretScrubber
         'credential',
         'credentials',
         'x_amz_signature',
+        'x_amz_security_token',
+        'x_goog_api_key',
+        'x_kongono_key',
+        'stripe_signature',
+        'php_auth_pw',
+        'credit_card',
+        'card_number',
+        'cvv',
+        'cvc',
+        'ssn',
+        'otp',
+        'totp',
+        'recovery_code',
+    ];
+
+    /** @var list<string> */
+    private const array SENSITIVE_KEY_PREFIXES = [
+        'password_',
+        'passwd_',
+        'passphrase_',
+        'secret_',
+        'token_',
+        'cookie_',
+        'private_key_',
+        'api_key_',
+        'apikey_',
+        'session_id_',
+        'credential_',
+        'credit_card_',
+        'card_number_',
     ];
 
     public static function scrub(string $text): string
@@ -104,24 +142,25 @@ final class SecretScrubber
 
         $out = [];
         foreach ($data as $key => $value) {
+            $safeKey = is_string($key) ? self::scrub($key) : $key;
             if (is_string($key) && self::isSensitiveKey($key)) {
-                $out[$key] = '[REDACTED]';
+                $out[$safeKey] = '[REDACTED]';
                 continue;
             }
 
             if (is_string($value)) {
-                $out[$key] = self::scrub($value);
+                $out[$safeKey] = self::scrub($value);
             } elseif (is_array($value)) {
-                $out[$key] = self::scrubArray($value, $depth + 1);
+                $out[$safeKey] = self::scrubArray($value, $depth + 1);
             } elseif ($value instanceof Throwable) {
-                $out[$key] = sprintf('[%s] %s', $value::class, self::scrub($value->getMessage()));
+                $out[$safeKey] = sprintf('[%s] %s', $value::class, self::scrub($value->getMessage()));
             } elseif ($value instanceof Stringable) {
-                $out[$key] = self::scrub((string) $value);
+                $out[$safeKey] = self::scrub((string) $value);
             } elseif (is_object($value)) {
                 // Never pass un-scrubbed arbitrary objects (which json_encode may serialize with secret properties)
-                $out[$key] = sprintf('[object %s]', $value::class);
+                $out[$safeKey] = sprintf('[object %s]', $value::class);
             } else {
-                $out[$key] = $value;
+                $out[$safeKey] = $value;
             }
         }
 
@@ -130,12 +169,22 @@ final class SecretScrubber
 
     public static function isSensitiveKey(string $key): bool
     {
-        // Normalize camelCase and kebab-case into snake_case (e.g. clientSecret -> client_secret, X-API-Key -> x_api_key)
-        $snake = (string) preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', trim($key));
-        $normalized = strtolower(str_replace('-', '_', $snake));
+        // Normalize camelCase, acronyms (DBPassword, APISecret, JWTToken, SSHPrivateKey), and kebab-case into snake_case
+        $snake = (string) preg_replace('/([A-Z]+)([A-Z][a-z])/', '$1_$2', trim($key));
+        $snake = (string) preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', $snake);
+        $normalized = strtolower(str_replace(['-', '.', ' '], '_', $snake));
 
         foreach (self::SENSITIVE_KEYS as $needle) {
-            if ($normalized === $needle || str_ends_with($normalized, '_' . $needle)) {
+            if (
+                $normalized === $needle
+                || str_ends_with($normalized, '_' . $needle)
+                || str_contains($normalized, '_' . $needle . '_')
+            ) {
+                return true;
+            }
+        }
+        foreach (self::SENSITIVE_KEY_PREFIXES as $prefix) {
+            if (str_starts_with($normalized, $prefix)) {
                 return true;
             }
         }

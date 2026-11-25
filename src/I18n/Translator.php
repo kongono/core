@@ -10,9 +10,13 @@ final class Translator
     /** @var array<string, array<string, string>> */
     private array $catalogs = [];
 
+    private readonly string $fallbackLocale;
+
     public function __construct(
-        private readonly string $fallbackLocale = 'en',
-    ) {}
+        string $fallbackLocale = 'en',
+    ) {
+        $this->fallbackLocale = strtolower($fallbackLocale);
+    }
 
     /** @param array<string, string> $messages */
     public function addMessages(string $locale, array $messages): self
@@ -74,7 +78,7 @@ final class Translator
         return strtr($selected, $replacements);
     }
 
-    /** Pick the best supported locale from an HTTP Accept-Language header. */
+    /** Pick the best supported locale from an HTTP Accept-Language header (respecting RFC 9110 q-values). */
     public function negotiate(string $acceptLanguage): string
     {
         $supported = array_keys($this->catalogs);
@@ -82,8 +86,38 @@ final class Translator
             return $this->fallbackLocale;
         }
 
-        foreach (explode(',', $acceptLanguage) as $part) {
-            $tag = strtolower(trim(explode(';', $part, 2)[0]));
+        /** @var list<array{tag: string, q: float, pos: int}> $candidates */
+        $candidates = [];
+        foreach (explode(',', $acceptLanguage) as $pos => $part) {
+            $segments = explode(';', $part);
+            $tag = strtolower(trim($segments[0]));
+            if ('' === $tag) {
+                continue;
+            }
+            $q = 1.0;
+            foreach (array_slice($segments, 1) as $param) {
+                $param = strtolower(trim($param));
+                if (str_starts_with($param, 'q=')) {
+                    $qRaw = substr($param, 2);
+                    if (is_numeric($qRaw)) {
+                        $q = max(0.0, min(1.0, (float) $qRaw));
+                    }
+                }
+            }
+            if ($q <= 0.0) {
+                continue;
+            }
+            $candidates[] = ['tag' => $tag, 'q' => $q, 'pos' => $pos];
+        }
+
+        usort($candidates, static function (array $a, array $b): int {
+            $cmp = $b['q'] <=> $a['q'];
+
+            return 0 !== $cmp ? $cmp : ($a['pos'] <=> $b['pos']);
+        });
+
+        foreach ($candidates as $cand) {
+            $tag = $cand['tag'];
             if (in_array($tag, $supported, true)) {
                 return $tag;
             }

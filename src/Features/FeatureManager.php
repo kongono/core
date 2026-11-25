@@ -54,8 +54,8 @@ final class FeatureManager
             if (null === $scopeKey || '' === $scopeKey) {
                 return false;
             }
-            $hex = substr(hash('xxh128', $feature . ':' . $scopeKey), 0, 8);
-            $bucket = hexdec($hex) % 100;
+            $hex = substr(hash('xxh128', $feature . "\0" . $scopeKey), 0, 8);
+            $bucket = ((int) hexdec($hex)) % 100;
 
             return $bucket < $clamped;
         });

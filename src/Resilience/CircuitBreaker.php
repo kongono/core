@@ -17,6 +17,7 @@ final class CircuitBreaker
     private CircuitState $state = CircuitState::Closed;
     private int $consecutiveFailures = 0;
     private ?int $openedAt = null;
+    private bool $halfOpenProbeInFlight = false;
 
     /**
      * @param positive-int $failureThreshold       Consecutive failures before tripping Open
@@ -55,6 +56,14 @@ final class CircuitBreaker
             throw new CoreException(sprintf('Circuit breaker for "%s" is OPEN; failing fast.', $this->serviceName));
         }
 
+        $isProbe = CircuitState::HalfOpen === $current;
+        if ($isProbe) {
+            if ($this->halfOpenProbeInFlight) {
+                throw new CoreException(sprintf('Circuit breaker for "%s" already has a HALF-OPEN probe in flight.', $this->serviceName));
+            }
+            $this->halfOpenProbeInFlight = true;
+        }
+
         try {
             $result = $operation();
             $this->recordSuccess();
@@ -64,6 +73,10 @@ final class CircuitBreaker
             // Record failure at completion time (not pre-call time) so slow timeouts still trigger full cooldown
             $this->recordFailure($now ?? time());
             throw $e;
+        } finally {
+            if ($isProbe) {
+                $this->halfOpenProbeInFlight = false;
+            }
         }
     }
 

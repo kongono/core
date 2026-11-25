@@ -42,8 +42,9 @@ final class Retry
                 }
 
                 $shift = min(30, max(0, $attempt - 1));
-                $rawDelay = $baseDelayMs > 0 ? (int) min((float) PHP_INT_MAX, (float) $baseDelayMs * (float) (1 << $shift)) : 0;
-                $delayMs = $cap > 0 ? min($cap, $rawDelay) : $rawDelay;
+                $maxSafeMs = intdiv(PHP_INT_MAX, 1000);
+                $rawDelay = $baseDelayMs > 0 ? (int) min((float) $maxSafeMs, (float) $baseDelayMs * (float) (1 << $shift)) : 0;
+                $delayMs = min($cap, $rawDelay);
                 if (null !== $sleeper) {
                     $sleeper($delayMs);
                 } elseif ($delayMs > 0) {

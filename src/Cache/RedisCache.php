@@ -6,6 +6,7 @@ namespace Kongono\Core\Cache;
 
 use Closure;
 use JsonException;
+use Kongono\Core\CoreException;
 
 /**
  * Distributed Redis / Valkey cache backed by Kongono's zero-dependency `RedisClient`.
@@ -17,7 +18,11 @@ final readonly class RedisCache implements AtomicCacheInterface
     public function __construct(
         private RedisClient $redis,
         private string $prefix = 'kongono:cache:',
-    ) {}
+    ) {
+        if ('' === $prefix) {
+            throw new CoreException('RedisCache prefix cannot be empty.');
+        }
+    }
 
     public function get(string $key, mixed $default = null): mixed
     {
@@ -73,6 +78,16 @@ final readonly class RedisCache implements AtomicCacheInterface
     public function delete(string $key): void
     {
         $this->redis->del($this->prefixed($key));
+    }
+
+    /** Atomically delete `$key` only when its stored value matches `$expectedValue` (safe distributed lock release). */
+    public function compareAndDelete(string $key, mixed $expectedValue): bool
+    {
+        $expectedJson = json_encode($expectedValue, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        $lua = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
+        $reply = $this->redis->eval($lua, [$this->prefixed($key)], [$expectedJson]);
+
+        return 1 === $reply || '1' === $reply;
     }
 
     public function clear(): void

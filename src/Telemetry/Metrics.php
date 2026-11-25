@@ -30,6 +30,9 @@ final class Metrics
     public function increment(string $name, array $labels = [], float $by = 1.0): void
     {
         self::assertValidMetric($name, $labels);
+        if (!is_finite($by)) {
+            throw new CoreException('Metric counter increment must be a finite number.');
+        }
         $key = $this->seriesKey($name, $labels);
         if (!isset($this->counters[$key])) {
             if (count($this->counters) >= $this->maxSeries) {
@@ -44,6 +47,9 @@ final class Metrics
     public function gauge(string $name, float $value, array $labels = []): void
     {
         self::assertValidMetric($name, $labels);
+        if (!is_finite($value)) {
+            throw new CoreException('Metric gauge value must be a finite number.');
+        }
         $key = $this->seriesKey($name, $labels);
         if (!isset($this->gauges[$key]) && count($this->gauges) >= $this->maxSeries) {
             return;
@@ -55,6 +61,9 @@ final class Metrics
     public function observe(string $name, float $value, array $labels = []): void
     {
         self::assertValidMetric($name, $labels);
+        if (!is_finite($value)) {
+            throw new CoreException('Metric observation value must be a finite number.');
+        }
         $key = $this->seriesKey($name, $labels);
         if (!isset($this->timings[$key])) {
             if (count($this->timings) >= $this->maxSeries) {
@@ -131,7 +140,7 @@ final class Metrics
 
         sort($lines, SORT_STRING);
 
-        return implode("\n", $lines) . ('' !== implode('', $lines) ? "\n" : '');
+        return [] !== $lines ? implode("\n", $lines) . "\n" : '';
     }
 
     /** @param array<string, string> $labels */
@@ -173,6 +182,13 @@ final class Metrics
 
     private function formatFloat(float $value): string
     {
-        return floor($value) === $value ? (string) (int) $value : sprintf('%.6F', $value);
+        if (!is_finite($value)) {
+            return is_nan($value) ? 'NaN' : ($value > 0 ? '+Inf' : '-Inf');
+        }
+        if (abs($value) <= 9.0e15 && floor($value) === $value) {
+            return (string) (int) $value;
+        }
+
+        return sprintf('%.6F', $value);
     }
 }

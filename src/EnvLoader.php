@@ -12,9 +12,16 @@ final class EnvLoader
         'REMOTE_ADDR',
         'REMOTE_HOST',
         'REMOTE_PORT',
+        'REMOTE_USER',
+        'PHP_AUTH_USER',
+        'PHP_AUTH_PW',
         'HTTPS',
         'REQUEST_URI',
         'REQUEST_METHOD',
+        'REQUEST_SCHEME',
+        'QUERY_STRING',
+        'CONTENT_TYPE',
+        'CONTENT_LENGTH',
         'SCRIPT_FILENAME',
         'SCRIPT_NAME',
         'DOCUMENT_ROOT',
@@ -26,6 +33,10 @@ final class EnvLoader
         'PHP_INI_SCAN_DIR',
         'PHPRC',
         'OPENSSL_CONF',
+        'OPENSSL_MODULES',
+        'OPENSSL_ENGINES',
+        'PATH_INFO',
+        'PHP_SELF',
         'HTTPS_PROXY',
         'ALL_PROXY',
         'NO_PROXY',
@@ -33,6 +44,8 @@ final class EnvLoader
         'SSL_CERT_FILE',
         'SSL_CERT_DIR',
         'PATH',
+        'COMSPEC',
+        'PATHEXT',
         'BASH_ENV',
         'ENV',
         'IFS',
@@ -40,6 +53,8 @@ final class EnvLoader
         'HOSTALIASES',
         'RESOLV_HOST_CONF',
         'NODE_OPTIONS',
+        'GIT_SSH_COMMAND',
+        'SENDMAIL_PATH',
     ];
 
     /**
@@ -58,7 +73,10 @@ final class EnvLoader
         }
 
         $loaded = [];
-        foreach ($lines as $line) {
+        foreach ($lines as $index => $line) {
+            if (0 === $index && str_starts_with($line, "\xEF\xBB\xBF")) {
+                $line = substr($line, 3);
+            }
             $trimmed = trim($line);
             if ('' === $trimmed || str_starts_with($trimmed, '#')) {
                 continue;
@@ -80,9 +98,11 @@ final class EnvLoader
             if (
                 in_array($upperKey, self::FORBIDDEN_KEYS, true)
                 || str_starts_with($upperKey, 'HTTP_')
+                || str_starts_with($upperKey, 'LD_')
                 || str_starts_with($upperKey, 'DYLD_')
                 || str_starts_with($upperKey, 'PHP_INI_')
                 || str_starts_with($upperKey, 'ZEND_')
+                || str_starts_with($upperKey, 'BASH_FUNC_')
             ) {
                 continue;
             }
@@ -107,22 +127,52 @@ final class EnvLoader
 
     private static function parseValue(string $raw): string
     {
-        if (strlen($raw) >= 2) {
-            $first = $raw[0];
-            $last = $raw[strlen($raw) - 1];
-            if (('"' === $first && '"' === $last) || ("'" === $first && "'" === $last)) {
-                $inner = substr($raw, 1, -1);
-
-                return '"' === $first
-                    ? str_replace(['\\n', '\\r', '\\t', '\\"', '\\\\'], ["\n", "\r", "\t", '"', '\\'], $inner)
-                    : $inner;
-            }
+        $len = strlen($raw);
+        if (0 === $len) {
+            return '';
         }
 
-        // Strip inline comments on unquoted values
-        $hashPos = strpos($raw, ' #');
-        if (false !== $hashPos) {
-            return trim(substr($raw, 0, $hashPos));
+        $first = $raw[0];
+        if ('"' === $first || "'" === $first) {
+            $out = '';
+            $escaped = false;
+            for ($i = 1; $i < $len; ++$i) {
+                $ch = $raw[$i];
+                if ('"' === $first && $escaped) {
+                    $out .= match ($ch) {
+                        'n' => "\n",
+                        'r' => "\r",
+                        't' => "\t",
+                        '"' => '"',
+                        '\\' => '\\',
+                        default => '\\' . $ch,
+                    };
+                    $escaped = false;
+                    continue;
+                }
+                if ('"' === $first && '\\' === $ch) {
+                    $escaped = true;
+                    continue;
+                }
+                if ($ch === $first) {
+                    // Only accept closing quote if remaining characters are whitespace or a trailing # comment
+                    $tail = ltrim(substr($raw, $i + 1));
+                    if ('' === $tail || str_starts_with($tail, '#')) {
+                        return $out;
+                    }
+                }
+                $out .= $ch;
+            }
+            if ($escaped) {
+                $out .= '\\';
+            }
+
+            return $out;
+        }
+
+        // Strip inline comments on unquoted values preceded by space or tab
+        if (1 === preg_match('/[ \t]#/', $raw, $m, PREG_OFFSET_CAPTURE)) {
+            return rtrim(substr($raw, 0, $m[0][1]));
         }
 
         return $raw;

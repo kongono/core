@@ -12,9 +12,13 @@ final class MemoryCache implements AtomicCacheInterface
     /** @var array<string, array{value: mixed, expires_at: int}> */
     private array $entries = [];
 
+    private readonly int $maxEntries;
+
     public function __construct(
-        private readonly int $maxEntries = 1000,
-    ) {}
+        int $maxEntries = 1000,
+    ) {
+        $this->maxEntries = max(1, $maxEntries);
+    }
 
     public function get(string $key, mixed $default = null, ?int $now = null): mixed
     {
@@ -38,9 +42,7 @@ final class MemoryCache implements AtomicCacheInterface
             $this->evictExpired($ts);
             if (count($this->entries) >= $this->maxEntries) {
                 $oldestKey = array_key_first($this->entries);
-                if (null !== $oldestKey) {
-                    unset($this->entries[$oldestKey]);
-                }
+                unset($this->entries[$oldestKey]);
             }
         }
         $this->entries[$key] = [

@@ -32,14 +32,19 @@ final readonly class Async
             return [];
         }
 
+        $parentCaps = \Kongono\Core\Capabilities\ExecutionCapabilities::current();
+
         /** @var array<TKey, Fiber<mixed, mixed, TVal, mixed>> $fibers */
         $fibers = [];
         /** @var array<TKey, TVal> $results */
         $results = [];
 
         foreach ($tasks as $key => $task) {
+            $wrapped = null !== $parentCaps
+                ? static fn(): mixed => \Kongono\Core\Capabilities\ExecutionCapabilities::withActive($parentCaps, $task)
+                : $task;
             /** @var Fiber<mixed, mixed, TVal, mixed> $fiber */
-            $fiber = new Fiber($task);
+            $fiber = new Fiber($wrapped);
             $fibers[$key] = $fiber;
         }
 
@@ -88,11 +93,16 @@ final readonly class Async
      */
     public static function race(array $tasks): mixed
     {
+        $parentCaps = \Kongono\Core\Capabilities\ExecutionCapabilities::current();
+
         /** @var list<Fiber<mixed, mixed, TVal, mixed>> $fibers */
         $fibers = [];
         foreach ($tasks as $task) {
+            $wrapped = null !== $parentCaps
+                ? static fn(): mixed => \Kongono\Core\Capabilities\ExecutionCapabilities::withActive($parentCaps, $task)
+                : $task;
             /** @var Fiber<mixed, mixed, TVal, mixed> $fiber */
-            $fiber = new Fiber($task);
+            $fiber = new Fiber($wrapped);
             $fibers[] = $fiber;
         }
 

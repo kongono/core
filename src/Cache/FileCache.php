@@ -42,6 +42,54 @@ final readonly class FileCache implements AtomicCacheInterface
         $this->withLock($key, function (string $file) use ($value, $ttlSeconds): void {
             $this->writeEntry($file, $value, time() + max(1, $ttlSeconds));
         });
+
+        if (1 === random_int(1, 100)) {
+            $this->pruneExpired();
+        }
+    }
+
+    /**
+     * Remove expired cache files in bounded batches to prevent unbounded inode accumulation.
+     */
+    public function pruneExpired(int $maxScan = 200): int
+    {
+        $files = glob($this->dir . DIRECTORY_SEPARATOR . '*.cache.json');
+        if (false === $files) {
+            return 0;
+        }
+
+        $pruned = 0;
+        $scanned = 0;
+        $limit = max(1, $maxScan);
+        foreach ($files as $file) {
+            if ($scanned >= $limit) {
+                break;
+            }
+            ++$scanned;
+            if (is_link($file) || !is_file($file)) {
+                continue;
+            }
+            $base = basename($file);
+            if (strlen($base) < 2) {
+                continue;
+            }
+            $shard = substr($base, 0, 2);
+            if ($this->withShardLock($shard, fn(): bool => $this->unlinkIfExpired($file))) {
+                ++$pruned;
+            }
+        }
+
+        return $pruned;
+    }
+
+    private function unlinkIfExpired(string $file): bool
+    {
+        if (null !== $this->readEntry($file, unlinkExpired: true)) {
+            return false;
+        }
+        clearstatcache(true, $file);
+
+        return !is_file($file);
     }
 
     public function add(string $key, mixed $value, int $ttlSeconds = 300): bool
@@ -227,7 +275,19 @@ final readonly class FileCache implements AtomicCacheInterface
     {
         $hash = hash('sha256', $key);
         $file = $this->dir . DIRECTORY_SEPARATOR . $hash . '.cache.json';
-        $lockFile = $this->dir . DIRECTORY_SEPARATOR . 'shard-' . substr($hash, 0, 2) . '.lock';
+
+        return $this->withShardLock(substr($hash, 0, 2), static fn(): mixed => $fn($file));
+    }
+
+    /**
+     * @template T
+     * @param Closure(): T $fn
+     * @return T
+     */
+    private function withShardLock(string $shard, Closure $fn): mixed
+    {
+        $safeShard = preg_replace('/[^0-9a-f]/', '0', strtolower($shard));
+        $lockFile = $this->dir . DIRECTORY_SEPARATOR . 'shard-' . (is_string($safeShard) && '' !== $safeShard ? $safeShard : '00') . '.lock';
         if (is_link($lockFile)) {
             throw new CoreException('Refusing to open symbolic link cache lock.');
         }
@@ -243,7 +303,7 @@ final readonly class FileCache implements AtomicCacheInterface
                 throw new CoreException('Unable to lock cache entry.');
             }
 
-            return $fn($file);
+            return $fn();
         } finally {
             flock($handle, LOCK_UN);
             fclose($handle);

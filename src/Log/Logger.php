@@ -37,8 +37,9 @@ final class Logger extends AbstractLogger
         string $minLevel = LogLevel::DEBUG,
         private readonly mixed $stream = null,
         private readonly bool $retainInMemory = false,
+        private readonly int $maxInMemoryRecords = 1000,
     ) {
-        $this->minSeverity = self::SEVERITY[$minLevel] ?? 100;
+        $this->minSeverity = self::SEVERITY[strtolower($minLevel)] ?? 100;
     }
 
     /**
@@ -66,6 +67,9 @@ final class Logger extends AbstractLogger
         ];
 
         if ($this->retainInMemory) {
+            if ($this->maxInMemoryRecords > 0 && count($this->records) >= $this->maxInMemoryRecords) {
+                array_shift($this->records);
+            }
             $this->records[] = $record;
         }
 
@@ -114,24 +118,25 @@ final class Logger extends AbstractLogger
         $clean = [];
         foreach ($context as $key => $value) {
             $strKey = (string) $key;
+            $safeKey = self::stripAnsi(SecretScrubber::scrub($strKey));
             if (SecretScrubber::isSensitiveKey($strKey)) {
-                $clean[$strKey] = '[REDACTED]';
+                $clean[$safeKey] = '[REDACTED]';
                 continue;
             }
             if (is_string($value)) {
-                $clean[$strKey] = self::stripAnsi(SecretScrubber::scrub($value));
+                $clean[$safeKey] = self::stripAnsi(SecretScrubber::scrub($value));
             } elseif (is_array($value)) {
-                $clean[$strKey] = $this->scrubContext($value, $depth + 1);
+                $clean[$safeKey] = $this->scrubContext($value, $depth + 1);
             } elseif (is_float($value) && !is_finite($value)) {
-                $clean[$strKey] = is_nan($value) ? 'NAN' : ($value > 0 ? 'INF' : '-INF');
+                $clean[$safeKey] = is_nan($value) ? 'NAN' : ($value > 0 ? 'INF' : '-INF');
             } elseif (is_scalar($value) || null === $value) {
-                $clean[$strKey] = $value;
+                $clean[$safeKey] = $value;
             } elseif ($value instanceof \Throwable) {
-                $clean[$strKey] = self::stripAnsi(sprintf('[%s] %s', $value::class, SecretScrubber::scrub($value->getMessage())));
+                $clean[$safeKey] = self::stripAnsi(sprintf('[%s] %s', $value::class, SecretScrubber::scrub($value->getMessage())));
             } elseif ($value instanceof Stringable) {
-                $clean[$strKey] = self::stripAnsi(SecretScrubber::scrub((string) $value));
+                $clean[$safeKey] = self::stripAnsi(SecretScrubber::scrub((string) $value));
             } else {
-                $clean[$strKey] = get_debug_type($value);
+                $clean[$safeKey] = get_debug_type($value);
             }
         }
 
@@ -140,9 +145,11 @@ final class Logger extends AbstractLogger
 
     private static function stripAnsi(string $text): string
     {
-        // Strip both CSI (\e[...) and OSC (\e]...\a or \e]...\e\\) terminal escape sequences
-        $noOsc = (string) preg_replace('/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)/', '', $text);
+        // Strip 7-bit/8-bit OSC (\e] / U+009D), DCS/SOS/PM/APC (\e[PX^_] / C1), ECMA-48 CSI (\e[ / U+009B), 2-byte ESC, and remaining C1/ESC bytes
+        $cleaned = (string) preg_replace('/(?:\x1b\]|\xC2\x9D)[\s\S]*?(?:\x07|\x1b\\\\|\xC2\x9C|\z)/', '', $text);
+        $cleaned = (string) preg_replace('/(?:\x1b[PX^_]|\xC2[\x90\x98\x9E\x9F])[\s\S]*?(?:\x1b\\\\|\xC2\x9C|\z)/', '', $cleaned);
+        $cleaned = (string) preg_replace('/(?:\x1b\[|\xC2\x9B)[0-9:;<=>?]*[ -\/]*[@-~]/', '', $cleaned);
 
-        return (string) preg_replace('/\x1b\[[0-9;?]*[ -\/]*[@-~]/', '', $noOsc);
+        return (string) preg_replace('/\x1b[@-Z\\\\-_]|\x1b|\xC2[\x80-\x9F]/', '', $cleaned);
     }
 }

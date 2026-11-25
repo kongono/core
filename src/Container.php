@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace Kongono\Core;
 
 use Closure;
+use Fiber;
 use Psr\Container\ContainerInterface;
 use ReflectionClass;
 use ReflectionNamedType;
+use WeakMap;
 
 /**
  * Explicit, zero-magic PSR-11 dependency injection container with autowiring
@@ -28,7 +30,10 @@ final class Container implements ContainerInterface
     private array $scopedInstances = [];
 
     /** @var array<string, true> */
-    private array $resolving = [];
+    private array $rootResolving = [];
+
+    /** @var ?WeakMap<object, array<string, true>> */
+    private ?WeakMap $fiberResolving = null;
 
     /** @var array<string, bool> */
     private array $instantiableCache = [];
@@ -129,9 +134,10 @@ final class Container implements ContainerInterface
 
     public function get(string $id): mixed
     {
+        $resolving = $this->currentResolving();
         // Prevent persistent-runtime cross-request/cross-tenant state leaks: a singleton MUST NEVER capture a scoped service
         if ('scoped' === ($this->lifetimes[$id] ?? null)) {
-            foreach (array_keys($this->resolving) as $ancestor) {
+            foreach (array_keys($resolving) as $ancestor) {
                 if ('singleton' === ($this->lifetimes[$ancestor] ?? null)) {
                     throw new ContainerException(sprintf(
                         'Captive scoped dependency rejected: singleton "%s" cannot capture per-scope service "%s".',
@@ -149,12 +155,12 @@ final class Container implements ContainerInterface
             return $this->scopedInstances[$id];
         }
 
-        if (isset($this->resolving[$id])) {
-            $chain = implode(' -> ', [...array_keys($this->resolving), $id]);
+        if (isset($resolving[$id])) {
+            $chain = implode(' -> ', [...array_keys($resolving), $id]);
             throw new ContainerException(sprintf('Circular dependency detected: %s.', $chain));
         }
 
-        $this->resolving[$id] = true;
+        $this->pushResolving($id);
 
         try {
             if (isset($this->factories[$id])) {
@@ -175,7 +181,60 @@ final class Container implements ContainerInterface
 
             throw new NotFoundException(sprintf('Service "%s" is not bound and is not an instantiable class.', $id));
         } finally {
-            unset($this->resolving[$id]);
+            $this->popResolving($id);
+        }
+    }
+
+    /** @return array<string, true> */
+    private function currentResolving(): array
+    {
+        $fiber = Fiber::getCurrent();
+        if (null === $fiber) {
+            return $this->rootResolving;
+        }
+
+        return null !== $this->fiberResolving && isset($this->fiberResolving[$fiber])
+            ? $this->fiberResolving[$fiber]
+            : [];
+    }
+
+    private function pushResolving(string $id): void
+    {
+        $fiber = Fiber::getCurrent();
+        if (null === $fiber) {
+            $this->rootResolving[$id] = true;
+
+            return;
+        }
+
+        if (null === $this->fiberResolving) {
+            /** @var WeakMap<object, array<string, true>> $map */
+            $map = new WeakMap();
+            $this->fiberResolving = $map;
+        }
+        $stack = $this->fiberResolving[$fiber] ?? [];
+        $stack[$id] = true;
+        $this->fiberResolving[$fiber] = $stack;
+    }
+
+    private function popResolving(string $id): void
+    {
+        $fiber = Fiber::getCurrent();
+        if (null === $fiber) {
+            unset($this->rootResolving[$id]);
+
+            return;
+        }
+
+        if (null === $this->fiberResolving || !isset($this->fiberResolving[$fiber])) {
+            return;
+        }
+        $stack = $this->fiberResolving[$fiber];
+        unset($stack[$id]);
+        if ([] === $stack) {
+            unset($this->fiberResolving[$fiber]);
+        } else {
+            $this->fiberResolving[$fiber] = $stack;
         }
     }
 
@@ -240,11 +299,27 @@ final class Container implements ContainerInterface
             $constructor = $reflection->getConstructor();
             if (null !== $constructor) {
                 foreach ($constructor->getParameters() as $parameter) {
+                    if ($parameter->isVariadic()) {
+                        continue;
+                    }
                     $type = $parameter->getType();
                     $hasDefault = $parameter->isDefaultValueAvailable();
+                    $classType = null;
+                    if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
+                        $rawTypeName = $type->getName();
+                        $lowerType = strtolower($rawTypeName);
+                        if ('self' === $lowerType) {
+                            $classType = $reflection->getName();
+                        } elseif ('parent' === $lowerType) {
+                            $parentClass = $reflection->getParentClass();
+                            $classType = false !== $parentClass ? $parentClass->getName() : null;
+                        } else {
+                            $classType = $rawTypeName;
+                        }
+                    }
                     $plan[] = [
                         'name' => $parameter->getName(),
-                        'classType' => ($type instanceof ReflectionNamedType && !$type->isBuiltin()) ? $type->getName() : null,
+                        'classType' => $classType,
                         'hasDefault' => $hasDefault,
                         'default' => $hasDefault ? $parameter->getDefaultValue() : null,
                         'allowsNull' => $type instanceof ReflectionNamedType ? $type->allowsNull() : true,
@@ -266,7 +341,7 @@ final class Container implements ContainerInterface
                     continue;
                 }
                 if ($param['hasDefault']) {
-                    $arguments[] = $param['default'];
+                    $arguments[] = self::cloneDefault($param['default']);
                     continue;
                 }
                 if ($param['allowsNull']) {
@@ -283,7 +358,7 @@ final class Container implements ContainerInterface
             }
 
             if ($param['hasDefault']) {
-                $arguments[] = $param['default'];
+                $arguments[] = self::cloneDefault($param['default']);
                 continue;
             }
 
@@ -295,5 +370,14 @@ final class Container implements ContainerInterface
         }
 
         return new $class(...$arguments);
+    }
+
+    private static function cloneDefault(mixed $value): mixed
+    {
+        if (!is_object($value) || $value instanceof \UnitEnum) {
+            return $value;
+        }
+
+        return (new ReflectionClass($value))->isCloneable() ? clone $value : $value;
     }
 }

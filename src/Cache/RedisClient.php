@@ -52,8 +52,9 @@ final class RedisClient
         if ($port < 1 || $port > 65535) {
             throw new CoreException(sprintf('Invalid Redis port %d.', $port));
         }
+        $safeTimeout = is_finite($timeout) ? max(0.05, $timeout) : 3.0;
 
-        $connector = static function () use ($host, $cleanHost, $port, $password, $database, $tls, $timeout, $username): mixed {
+        $connector = static function () use ($host, $cleanHost, $port, $password, $database, $tls, $safeTimeout, $username): mixed {
             $scheme = $tls ? 'tls' : 'tcp';
             $errno = 0;
             $errstr = '';
@@ -73,7 +74,7 @@ final class RedisClient
                 sprintf('%s://%s:%d', $scheme, $cleanHost, $port),
                 $errno,
                 $errstr,
-                $timeout,
+                $safeTimeout,
                 STREAM_CLIENT_CONNECT,
                 $context,
             );
@@ -81,7 +82,7 @@ final class RedisClient
                 throw new CoreException(sprintf('Unable to connect to Redis at %s:%d (%s).', $host, $port, $errstr));
             }
 
-            stream_set_timeout($stream, (int) $timeout, (int) (($timeout - floor($timeout)) * 1_000_000));
+            stream_set_timeout($stream, (int) $safeTimeout, (int) (($safeTimeout - floor($safeTimeout)) * 1_000_000));
             $bootstrap = new self($stream);
 
             if (null !== $password && '' !== $password) {
@@ -162,14 +163,42 @@ final class RedisClient
         return $out;
     }
 
+    /** @var array<string, true> */
+    private const array IDEMPOTENT_READ_COMMANDS = [
+        'PING' => true,
+        'GET' => true,
+        'MGET' => true,
+        'EXISTS' => true,
+        'TTL' => true,
+        'PTTL' => true,
+        'STRLEN' => true,
+        'HGET' => true,
+        'HGETALL' => true,
+        'HMGET' => true,
+        'HEXISTS' => true,
+        'SMEMBERS' => true,
+        'SISMEMBER' => true,
+        'SCARD' => true,
+        'ZRANGE' => true,
+        'ZRANGEBYSCORE' => true,
+        'ZSCORE' => true,
+        'ZCARD' => true,
+        'LRANGE' => true,
+        'LLEN' => true,
+        'SCAN' => true,
+        'TYPE' => true,
+    ];
+
     public function command(string ...$args): mixed
     {
         $wire = self::encodeCommand(...$args);
+        $cmdName = isset($args[0]) ? strtoupper($args[0]) : '';
+        $isIdempotent = isset(self::IDEMPOTENT_READ_COMMANDS[$cmdName]);
         $attempts = null !== $this->connector ? 2 : 1;
 
         for ($attempt = 1; $attempt <= $attempts; ++$attempt) {
             if (!is_resource($this->stream)) {
-                if ($attempt < $attempts && null !== $this->connector) {
+                if (null !== $this->connector) {
                     $this->reconnect();
                 } else {
                     throw new CoreException('Redis connection is closed.');
@@ -179,7 +208,8 @@ final class RedisClient
             try {
                 return $this->sendAndRead($wire);
             } catch (CoreException $e) {
-                if ($attempt < $attempts && null !== $this->connector && $this->isTransportError($e)) {
+                // Only auto-retry idempotent read commands after a transport drop; never replay mutating writes/INCR/EVAL
+                if ($attempt < $attempts && null !== $this->connector && $isIdempotent && $this->isTransportError($e)) {
                     $this->reconnect();
                     continue;
                 }
@@ -217,6 +247,7 @@ final class RedisClient
 
         return str_contains($msg, 'Failed writing command to Redis stream')
             || str_contains($msg, 'Unexpected EOF while reading Redis reply')
+            || str_contains($msg, 'Unexpected EOF while reading Redis bulk string')
             || str_contains($msg, 'Redis connection is closed');
     }
 
@@ -274,8 +305,9 @@ final class RedisClient
     public function incrByWithTtl(string $key, int $delta = 1, int $ttlSeconds = 300): int
     {
         $script = <<<'LUA'
+local existed = redis.call('EXISTS', KEYS[1])
 local v = redis.call('INCRBY', KEYS[1], tonumber(ARGV[1]))
-if v == tonumber(ARGV[1]) or redis.call('TTL', KEYS[1]) < 0 then
+if existed == 0 or redis.call('TTL', KEYS[1]) < 0 then
     redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
 end
 return v

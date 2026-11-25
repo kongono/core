@@ -48,8 +48,16 @@ final readonly class Config
     public function int(string $key, int $default = 0): int
     {
         $value = $this->get($key, $default);
+        if (is_int($value)) {
+            return $value;
+        }
+        if (is_string($value)) {
+            $validated = filter_var(trim($value), FILTER_VALIDATE_INT);
 
-        return is_int($value) ? $value : (is_numeric($value) ? (int) $value : $default);
+            return false !== $validated ? $validated : $default;
+        }
+
+        return $default;
     }
 
     public function bool(string $key, bool $default = false): bool
@@ -57,6 +65,13 @@ final readonly class Config
         $value = $this->get($key, $default);
         if (is_bool($value)) {
             return $value;
+        }
+        if (is_int($value)) {
+            return match ($value) {
+                1 => true,
+                0 => false,
+                default => $default,
+            };
         }
         if (is_string($value)) {
             return match (strtolower(trim($value))) {
