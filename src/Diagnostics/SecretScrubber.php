@@ -38,11 +38,6 @@ final class SecretScrubber
         ['/\b((?:set-)?cookie\s*:\s*)[^\r\n]+/i', '$1[REDACTED]'],
         ['/\b(kongono_(?:session|remember)=)[^;\s"\']+/i', '$1[REDACTED]'],
         ['/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b/', '[REDACTED_JWT]'],
-        // Quoted, JSON, and PHP array-literal (=>) key-value secret assignments (bounded key prefix/suffix prevents PCRE backtrack DoS; consumes escaped quotes)
-        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?key|token|jwt|authorization|private[_-]?key|signing[_-]?key|credentials?|cookie|session[_-]?id|totp|otp|recovery[_-]?code|stripe[_-]?signature)(?:[_-][A-Za-z0-9_-]{1,32})?["\']?\s*(?:=>|[:=])\s*)"(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^"\\\\\r\n])*+"/i', '$1"[REDACTED]"'],
-        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?key|token|jwt|authorization|private[_-]?key|signing[_-]?key|credentials?|cookie|session[_-]?id|totp|otp|recovery[_-]?code|stripe[_-]?signature)(?:[_-][A-Za-z0-9_-]{1,32})?["\']?\s*(?:=>|[:=])\s*)\'(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^\'\\\\\r\n])*+\'/i', '$1\'[REDACTED]\''],
-        // Generic unquoted key=value / key: value / key => value secret assignments (bounded key prefix/suffix prevents PCRE backtrack bypass)
-        ['/(\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?key|token|jwt|authorization|private[_-]?key|signing[_-]?key|credentials?|cookie|session[_-]?id|totp|otp|recovery[_-]?code|stripe[_-]?signature)(?:[_-][A-Za-z0-9_-]{1,32})?)(\s*(?:=>|[:=])\s*)(?!\[REDACTED)(?!(?:Bearer|Basic|Digest|AWS4-HMAC-SHA256)\s+\[REDACTED)[^\s,;\]"\'}]+/i', '$1$2[REDACTED]'],
     ];
 
     /** @var list<string> */
@@ -119,6 +114,65 @@ final class SecretScrubber
             $replaced = preg_replace($pattern, $replacement, $result);
             if (!is_string($replaced)) {
                 // Fail closed if PCRE hits backtrack/JIT limits so secrets can NEVER leak unscrubbed
+                return '[REDACTED: SCRUB_FAILED]';
+            }
+            $result = $replaced;
+        }
+
+        return self::scrubSensitiveAssignments($result);
+    }
+
+    /**
+     * Linear-time key-value assignment scrubber using `isSensitiveKey()` so arbitrarily long keys
+     * (>48 chars, camelCase, snake_case, kebab-case) are redacted consistently without PCRE backtracking.
+     */
+    private static function scrubSensitiveAssignments(string $text): string
+    {
+        $patterns = [
+            // Double-quoted values (`"key": "val"`, `key="val"`, `'key' => "val"`)
+            [
+                '/(["\']?)([A-Za-z_][A-Za-z0-9_.-]{1,255}+)\1(\s*(?:=>|[:=])\s*)"(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^"\\\\\r\n])*+"/i',
+                '"[REDACTED]"',
+                false,
+            ],
+            // Single-quoted values (`'key' => 'val'`, `key='val'`)
+            [
+                '/(["\']?)([A-Za-z_][A-Za-z0-9_.-]{1,255}+)\1(\s*(?:=>|[:=])\s*)\'(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^\'\\\\\r\n])*+\'/i',
+                "'[REDACTED]'",
+                false,
+            ],
+            // Unquoted values (`KEY=val`, `key: val`, `key => val`) — never clobber JSON/PHP `{`, `[`, `null`, `true`, `false`
+            [
+                '/(["\']?)([A-Za-z_][A-Za-z0-9_.-]{1,255}+)\1(\s*(?:=>|[:=])\s*)(?!\[REDACTED)(?!(?:Bearer|Basic|Digest|AWS4-HMAC-SHA256)\s+\[REDACTED)([^\s,;\]\[\{\}"\']+)/i',
+                '[REDACTED]',
+                true,
+            ],
+        ];
+
+        $result = $text;
+        foreach ($patterns as [$pattern, $redactedVal, $isUnquoted]) {
+            $replaced = preg_replace_callback(
+                $pattern,
+                static function (array $m) use ($redactedVal, $isUnquoted): string {
+                    if (!self::isSensitiveKey($m[2])) {
+                        return $m[0];
+                    }
+                    if ($isUnquoted) {
+                        $rawVal = strtolower($m[4] ?? '');
+                        if (in_array($rawVal, ['null', 'true', 'false'], true)) {
+                            return $m[0];
+                        }
+                        // Preserve valid JSON syntax when redacting unquoted scalar values under double-quoted JSON keys
+                        if ('"' === $m[1] && str_contains($m[3], ':')) {
+                            return $m[1] . $m[2] . $m[1] . $m[3] . '"[REDACTED]"';
+                        }
+                    }
+
+                    return $m[1] . $m[2] . $m[1] . $m[3] . $redactedVal;
+                },
+                $result,
+            );
+            if (!is_string($replaced)) {
                 return '[REDACTED: SCRUB_FAILED]';
             }
             $result = $replaced;
