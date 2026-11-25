@@ -85,15 +85,20 @@ final class RedisClient
             stream_set_timeout($stream, (int) $safeTimeout, (int) (($safeTimeout - floor($safeTimeout)) * 1_000_000));
             $bootstrap = new self($stream);
 
-            if (null !== $password && '' !== $password) {
-                if (null !== $username && '' !== $username) {
-                    $bootstrap->command('AUTH', $username, $password);
-                } else {
-                    $bootstrap->command('AUTH', $password);
+            try {
+                if (null !== $password && '' !== $password) {
+                    if (null !== $username && '' !== $username) {
+                        $bootstrap->command('AUTH', $username, $password);
+                    } else {
+                        $bootstrap->command('AUTH', $password);
+                    }
                 }
-            }
-            if ($database > 0) {
-                $bootstrap->command('SELECT', (string) $database);
+                if ($database > 0) {
+                    $bootstrap->command('SELECT', (string) $database);
+                }
+            } catch (\Throwable $e) {
+                @fclose($stream);
+                throw $e;
             }
 
             return $stream;
@@ -230,7 +235,7 @@ final class RedisClient
         $total = strlen($wire);
         $written = 0;
         while ($written < $total) {
-            $n = @fwrite($this->stream, substr($wire, $written));
+            $n = @fwrite($this->stream, substr($wire, $written, 65536));
             if (false === $n || 0 === $n) {
                 $this->close();
                 throw new CoreException('Failed writing command to Redis stream.');

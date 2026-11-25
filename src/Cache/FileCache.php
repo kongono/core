@@ -134,6 +134,21 @@ final readonly class FileCache implements AtomicCacheInterface
         });
     }
 
+    public function compareAndDelete(string $key, mixed $expectedValue): bool
+    {
+        return $this->withLock($key, function (string $file) use ($expectedValue): bool {
+            $entry = $this->readEntry($file, unlinkExpired: true);
+            if (null === $entry || $entry['value'] !== $expectedValue) {
+                return false;
+            }
+            if (!is_link($file) && is_file($file)) {
+                @unlink($file);
+            }
+
+            return true;
+        });
+    }
+
     public function has(string $key): bool
     {
         $sentinel = new \stdClass();

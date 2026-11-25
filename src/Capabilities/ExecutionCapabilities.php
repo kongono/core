@@ -121,6 +121,12 @@ final class ExecutionCapabilities
         'LO_UNLINK' => true,
         'LO_PUT' => true,
         'LO_FROM_BYTEA' => true,
+        'LO_OPEN' => true,
+        'LO_WRITE' => true,
+        'LO_TRUNCATE' => true,
+        'LO_TRUNCATE64' => true,
+        'LO_LSEEK' => true,
+        'LO_LSEEK64' => true,
         'PG_FILE_WRITE' => true,
         'PG_FILE_UNLINK' => true,
         'PG_READ_FILE' => true,
@@ -132,16 +138,31 @@ final class ExecutionCapabilities
         'PG_ROTATE_LOGFILE' => true,
         'PG_SWITCH_WAL' => true,
         'PG_STAT_RESET' => true,
+        'PG_CREATE_RESTORE_POINT' => true,
+        'PG_CREATE_PHYSICAL_REPLICATION_SLOT' => true,
+        'PG_CREATE_LOGICAL_REPLICATION_SLOT' => true,
+        'PG_DROP_REPLICATION_SLOT' => true,
+        'PG_LOGICAL_EMIT_MESSAGE' => true,
+        'PG_PROMOTE' => true,
         'NEXTVAL' => true,
         'SETVAL' => true,
         'PG_ADVISORY_LOCK' => true,
         'PG_ADVISORY_XACT_LOCK' => true,
         'PG_TRY_ADVISORY_LOCK' => true,
+        'PG_TRY_ADVISORY_XACT_LOCK' => true,
+        'PG_ADVISORY_LOCK_SHARED' => true,
+        'PG_ADVISORY_XACT_LOCK_SHARED' => true,
+        'PG_TRY_ADVISORY_LOCK_SHARED' => true,
+        'PG_TRY_ADVISORY_XACT_LOCK_SHARED' => true,
         'PG_ADVISORY_UNLOCK' => true,
+        'PG_ADVISORY_UNLOCK_SHARED' => true,
         'PG_ADVISORY_UNLOCK_ALL' => true,
         'GET_LOCK' => true,
         'RELEASE_LOCK' => true,
+        'DBLINK' => true,
+        'DBLINK_CONNECT' => true,
         'DBLINK_EXEC' => true,
+        'DBLINK_SEND_QUERY' => true,
     ];
 
     private int $queryCount = 0;
@@ -224,17 +245,31 @@ final class ExecutionCapabilities
 
     /**
      * Return the active `ExecutionCapabilities` for the current Fiber / request frame, if any.
+     * Inherits from running ancestor Fibers while staying strictly isolated from suspended sibling Fibers.
      */
     public static function current(): ?self
     {
         $fiber = Fiber::getCurrent();
         if (null !== $fiber) {
-            if (null === self::$fiberStacks || !isset(self::$fiberStacks[$fiber])) {
-                return [] !== self::$rootStack ? self::$rootStack[count(self::$rootStack) - 1] : null;
-            }
-            $stack = self::$fiberStacks[$fiber];
+            if (null !== self::$fiberStacks) {
+                if (isset(self::$fiberStacks[$fiber]) && [] !== self::$fiberStacks[$fiber]) {
+                    $stack = self::$fiberStacks[$fiber];
 
-            return [] !== $stack ? $stack[count($stack) - 1] : null;
+                    return $stack[count($stack) - 1];
+                }
+                // Walk active running ancestor Fibers (suspended sibling Fibers have isRunning() === false)
+                $ancestor = null;
+                foreach (self::$fiberStacks as $candidateFiber => $stack) {
+                    if ($candidateFiber instanceof Fiber && $candidateFiber->isRunning() && [] !== $stack) {
+                        $ancestor = $stack[count($stack) - 1];
+                    }
+                }
+                if (null !== $ancestor) {
+                    return $ancestor;
+                }
+            }
+
+            return [] !== self::$rootStack ? self::$rootStack[count(self::$rootStack) - 1] : null;
         }
 
         return [] !== self::$rootStack ? self::$rootStack[count(self::$rootStack) - 1] : null;
@@ -249,6 +284,11 @@ final class ExecutionCapabilities
      */
     public static function withActive(self $capabilities, Closure $callback): mixed
     {
+        $outer = self::current();
+        $effective = (null !== $outer && $outer !== $capabilities && !$capabilities->hasAncestor($outer))
+            ? $outer->merge($capabilities)
+            : $capabilities;
+
         $fiber = Fiber::getCurrent();
         if (null !== $fiber) {
             if (null === self::$fiberStacks) {
@@ -257,7 +297,7 @@ final class ExecutionCapabilities
                 self::$fiberStacks = $map;
             }
             $stack = self::$fiberStacks[$fiber] ?? [];
-            $stack[] = $capabilities;
+            $stack[] = $effective;
             self::$fiberStacks[$fiber] = $stack;
 
             try {
@@ -275,13 +315,26 @@ final class ExecutionCapabilities
             }
         }
 
-        self::$rootStack[] = $capabilities;
+        self::$rootStack[] = $effective;
 
         try {
             return $callback();
         } finally {
             array_pop(self::$rootStack);
         }
+    }
+
+    private function hasAncestor(self $candidate): bool
+    {
+        $cur = $this->parent;
+        while (null !== $cur) {
+            if ($cur === $candidate) {
+                return true;
+            }
+            $cur = $cur->parent;
+        }
+
+        return false;
     }
 
     /**
@@ -323,6 +376,8 @@ final class ExecutionCapabilities
      */
     public function assertDbQueryAllowed(string $sql): void
     {
+        $this->parent?->assertDbQueryAllowed($sql);
+
         if (
             $this->readOnlyDb
             && !(self::isRlsSetConfigAllowed() && 'SELECT set_config(?, ?, true)' === trim($sql))
@@ -407,6 +462,8 @@ final class ExecutionCapabilities
         $i = 0;
         /** @var list<string> $words */
         $words = [];
+        /** @var list<string> $tokens */
+        $tokens = [];
         $sawSemicolon = false;
         $hasEquals = false;
         $hasParen = false;
@@ -503,6 +560,7 @@ final class ExecutionCapabilities
                 if (!$closed) {
                     return true;
                 }
+                $tokens[] = '<STR>';
                 continue;
             }
 
@@ -533,8 +591,12 @@ final class ExecutionCapabilities
                 if (!$closed) {
                     return true;
                 }
-                if ('' !== $ident && self::isFollowedByOpenParen($sql, $i, $len)) {
-                    $functionCalls[] = strtoupper($ident);
+                if ('' !== $ident) {
+                    $upperIdent = strtoupper($ident);
+                    $tokens[] = $upperIdent;
+                    if (self::isFollowedByOpenParen($sql, $i, $len)) {
+                        $functionCalls[] = $upperIdent;
+                    }
                 }
                 continue;
             }
@@ -550,6 +612,11 @@ final class ExecutionCapabilities
                 }
             }
 
+            // PostgreSQL Unicode-escaped identifiers/strings (`U&"..."` / `U&'...'` + `UESCAPE`) -> fail closed
+            if (('U' === $ch || 'u' === $ch) && $i + 1 < $len && '&' === $sql[$i + 1]) {
+                return true;
+            }
+
             if (';' === $ch) {
                 $sawSemicolon = true;
                 ++$i;
@@ -558,12 +625,20 @@ final class ExecutionCapabilities
 
             if ('=' === $ch) {
                 $hasEquals = true;
+                $tokens[] = '=';
                 ++$i;
                 continue;
             }
 
             if ('(' === $ch) {
                 $hasParen = true;
+                $tokens[] = '(';
+                ++$i;
+                continue;
+            }
+
+            if (')' === $ch || '.' === $ch || ',' === $ch) {
+                $tokens[] = $ch;
                 ++$i;
                 continue;
             }
@@ -576,7 +651,11 @@ final class ExecutionCapabilities
                     ++$i;
                 }
                 $word = strtoupper(substr($sql, $start, $i - $start));
+                if ('UESCAPE' === $word) {
+                    return true;
+                }
                 $words[] = $word;
+                $tokens[] = $word;
 
                 if (self::isFollowedByOpenParen($sql, $i, $len)) {
                     $functionCalls[] = $word;
@@ -584,6 +663,7 @@ final class ExecutionCapabilities
                 continue;
             }
 
+            $tokens[] = $ch;
             ++$i;
         }
 
@@ -596,21 +676,35 @@ final class ExecutionCapabilities
             return true;
         }
 
-        // Strict read-only PRAGMA allowlist (blocks `PRAGMA writable_schema = ON`, `PRAGMA foreign_keys(0)`, etc.)
+        // Strict read-only PRAGMA grammar: `PRAGMA [schema.]<safe_pragma>[ ( <ident> ) ]`
+        // Blocks `PRAGMA writable_schema = ON`, `PRAGMA foreign_keys(0)`, `PRAGMA foreign_keys(table_info)`, etc.
         if ('PRAGMA' === $first) {
-            if ($hasEquals || count($words) < 2) {
+            if ($hasEquals || count($tokens) < 2) {
                 return true;
             }
-            // Allow `PRAGMA table_info(users)` or `PRAGMA main.table_info(users)` only for known read-only pragmas
-            $pragmaName = $words[1];
-            if (!isset(self::SAFE_READ_PRAGMAS[$pragmaName])) {
-                if (count($words) >= 3 && isset(self::SAFE_READ_PRAGMAS[$words[2]])) {
-                    $pragmaName = $words[2];
-                } else {
-                    return true;
-                }
+            $pos = 1;
+            $tokCount = count($tokens);
+            // Optional `schema.` prefix (only when explicitly separated by `.`)
+            if ($pos + 2 < $tokCount && '.' === $tokens[$pos + 1]) {
+                $pos += 2;
             }
-            if ($hasParen && !in_array($pragmaName, ['TABLE_INFO', 'TABLE_XINFO', 'INDEX_LIST', 'INDEX_INFO', 'INDEX_XINFO', 'FOREIGN_KEY_LIST'], true)) {
+            $pragmaName = $tokens[$pos] ?? '';
+            if (!isset(self::SAFE_READ_PRAGMAS[$pragmaName])) {
+                return true;
+            }
+            ++$pos;
+            if ($pos === $tokCount) {
+                return false;
+            }
+            // Only specific table/index introspection PRAGMAs may take a single `(ident|string)` argument
+            $argToken = $tokens[$pos + 1] ?? '';
+            if (
+                !in_array($pragmaName, ['TABLE_INFO', 'TABLE_XINFO', 'INDEX_LIST', 'INDEX_INFO', 'INDEX_XINFO', 'FOREIGN_KEY_LIST'], true)
+                || $tokCount !== $pos + 3
+                || '(' !== $tokens[$pos]
+                || ')' !== $tokens[$pos + 2]
+                || in_array($argToken, ['', '(', ')', ',', '=', '.'], true)
+            ) {
                 return true;
             }
 

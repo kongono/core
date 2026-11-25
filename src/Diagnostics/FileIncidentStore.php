@@ -10,6 +10,7 @@ namespace Kongono\Core\Diagnostics;
 final readonly class FileIncidentStore implements IncidentStoreInterface
 {
     private const string REF_PATTERN = '/\AKGN-\d{8}-[A-F0-9]{8}\z/';
+    private const int MAX_RECORD_BYTES = 262_144;
 
     public function __construct(
         private string $directory,
@@ -21,15 +22,31 @@ final readonly class FileIncidentStore implements IncidentStoreInterface
         if (1 !== preg_match(self::REF_PATTERN, $incident->reference)) {
             return;
         }
+        if ($this->isSymlink($this->directory)) {
+            return;
+        }
         if (!is_dir($this->directory)) {
             @mkdir($this->directory, 0o750, true);
+            if (!is_dir($this->directory)) {
+                return;
+            }
         }
 
         $path = $this->directory . DIRECTORY_SEPARATOR . $incident->reference . '.json';
-        if (is_link($path)) {
+        if ($this->isSymlink($path)) {
             return;
         }
-        $json = json_encode($incident->toArray(), JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        $payload = $incident->toArray();
+        $json = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        if (strlen($json) > self::MAX_RECORD_BYTES) {
+            $payload['body'] = ['_truncated' => true];
+            $payload['query'] = ['_truncated' => true];
+            $payload['headers'] = ['_truncated' => 'true'];
+            $json = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+            if (strlen($json) > self::MAX_RECORD_BYTES) {
+                return;
+            }
+        }
         $tmp = $path . '.' . bin2hex(random_bytes(8)) . '.tmp';
         $handle = @fopen($tmp, 'xb');
         if (false !== $handle) {
@@ -57,12 +74,20 @@ final readonly class FileIncidentStore implements IncidentStoreInterface
         if (1 !== preg_match(self::REF_PATTERN, $normalized)) {
             return null;
         }
-
-        $path = $this->directory . DIRECTORY_SEPARATOR . $normalized . '.json';
-        if (!is_file($path)) {
+        if (is_link($this->directory) || !is_dir($this->directory)) {
             return null;
         }
-        $raw = @file_get_contents($path);
+
+        $path = $this->directory . DIRECTORY_SEPARATOR . $normalized . '.json';
+        if (is_link($path) || !is_file($path)) {
+            return null;
+        }
+        $realDir = realpath($this->directory);
+        $realPath = realpath($path);
+        if (false === $realDir || false === $realPath || !str_starts_with($realPath, $realDir . DIRECTORY_SEPARATOR)) {
+            return null;
+        }
+        $raw = @file_get_contents($realPath);
         if (false === $raw) {
             return null;
         }
@@ -77,7 +102,11 @@ final readonly class FileIncidentStore implements IncidentStoreInterface
 
     public function recent(int $limit = 20): array
     {
-        if (!is_dir($this->directory)) {
+        if (is_link($this->directory) || !is_dir($this->directory)) {
+            return [];
+        }
+        $realDir = realpath($this->directory);
+        if (false === $realDir) {
             return [];
         }
         $files = glob($this->directory . DIRECTORY_SEPARATOR . 'KGN-*.json');
@@ -87,13 +116,24 @@ final readonly class FileIncidentStore implements IncidentStoreInterface
 
         $mtimes = [];
         foreach ($files as $file) {
+            if (is_link($file)) {
+                continue;
+            }
             $mt = @filemtime($file);
             $mtimes[$file] = false !== $mt ? $mt : 0;
         }
-        usort($files, static fn(string $a, string $b): int => $mtimes[$b] <=> $mtimes[$a]);
+        $safeFiles = array_keys($mtimes);
+        usort($safeFiles, static fn(string $a, string $b): int => $mtimes[$b] <=> $mtimes[$a]);
         $records = [];
-        foreach (array_slice($files, 0, max(1, $limit)) as $file) {
-            $raw = @file_get_contents($file);
+        foreach (array_slice($safeFiles, 0, max(1, $limit)) as $file) {
+            if (is_link($file)) {
+                continue;
+            }
+            $realPath = realpath($file);
+            if (false === $realPath || !str_starts_with($realPath, $realDir . DIRECTORY_SEPARATOR)) {
+                continue;
+            }
+            $raw = @file_get_contents($realPath);
             if (false === $raw) {
                 continue;
             }
@@ -126,5 +166,12 @@ final readonly class FileIncidentStore implements IncidentStoreInterface
         foreach (array_slice($files, $this->maxRecords) as $stale) {
             @unlink($stale);
         }
+    }
+
+    private function isSymlink(string $path): bool
+    {
+        clearstatcache(true, $path);
+
+        return is_link($path);
     }
 }

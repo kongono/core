@@ -93,6 +93,25 @@ final class MemoryCache implements AtomicCacheInterface
         return $entry['value'];
     }
 
+    public function compareAndDelete(string $key, mixed $expectedValue, ?int $now = null): bool
+    {
+        $ts = $now ?? time();
+        if (!isset($this->entries[$key])) {
+            return false;
+        }
+        if ($this->entries[$key]['expires_at'] <= $ts) {
+            unset($this->entries[$key]);
+
+            return false;
+        }
+        if ($this->entries[$key]['value'] !== $expectedValue) {
+            return false;
+        }
+        unset($this->entries[$key]);
+
+        return true;
+    }
+
     private function evictExpired(int $now): void
     {
         foreach ($this->entries as $k => $entry) {

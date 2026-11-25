@@ -671,7 +671,7 @@ final readonly class ErrorExplainer
             if (str_starts_with($name, '__')) {
                 continue;
             }
-            $dist = levenshtein($needle, strtolower($name));
+            $dist = self::boundedLevenshtein($needle, strtolower($name));
             $maxDist = max(2, (int) floor(strlen($needle) / 2));
             if ($dist <= $maxDist) {
                 $scored[$name] = $dist;
@@ -722,7 +722,7 @@ final readonly class ErrorExplainer
             }
             $rMethod = strtoupper($parts[0]);
             $rPath = '/' . trim($parts[1], '/');
-            $dist = levenshtein(strtolower($normPath), strtolower($rPath));
+            $dist = self::boundedLevenshtein(strtolower($normPath), strtolower($rPath));
             $penalty = $rMethod === $method ? 0 : 1;
             $maxDist = max(3, (int) floor(strlen($normPath) * 0.45));
             if ($dist <= $maxDist) {
@@ -761,7 +761,7 @@ final readonly class ErrorExplainer
                 continue;
             }
             $logical = substr($full, strlen($prefix), -strlen('.kgn.html'));
-            $dist = levenshtein($needle, strtolower($logical));
+            $dist = self::boundedLevenshtein($needle, strtolower($logical));
             if ($dist <= max(3, (int) floor(strlen($needle) * 0.45))) {
                 $scored[$logical] = $dist;
             }
@@ -770,6 +770,16 @@ final readonly class ErrorExplainer
         asort($scored);
 
         return array_slice(array_keys($scored), 0, 3);
+    }
+
+    private static function boundedLevenshtein(string $a, string $b): int
+    {
+        if (strlen($a) > 255 || strlen($b) > 255) {
+            return PHP_INT_MAX;
+        }
+        $dist = levenshtein($a, $b);
+
+        return $dist >= 0 ? $dist : PHP_INT_MAX;
     }
 
     private function explainDatabaseError(

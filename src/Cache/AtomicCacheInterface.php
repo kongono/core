@@ -18,4 +18,7 @@ interface AtomicCacheInterface extends CacheInterface
 
     /** Atomically read and delete a key so single-use tokens/challenges can be consumed at most once. */
     public function pull(string $key, mixed $default = null): mixed;
+
+    /** Atomically delete `$key` only when its stored value matches `$expectedValue` (safe lock release). */
+    public function compareAndDelete(string $key, mixed $expectedValue): bool;
 }

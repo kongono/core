@@ -47,6 +47,11 @@ final readonly class IncidentRecord
         public ?array $executionTrace = null,
     ) {}
 
+    private const int MAX_HEADERS = 64;
+    private const int MAX_HEADER_VALUE_BYTES = 512;
+    private const int MAX_PAYLOAD_NODES = 256;
+    private const int MAX_ARRAY_ENTRIES = 64;
+
     /**
      * Sanitize HTTP headers by dropping auth/cookie/secret headers and scrubbing values.
      *
@@ -56,33 +61,58 @@ final readonly class IncidentRecord
     public static function sanitizeHeaders(array $rawHeaders): array
     {
         $safe = [];
+        $count = 0;
         foreach ($rawHeaders as $name => $val) {
+            if ($count >= self::MAX_HEADERS) {
+                $safe['_truncated'] = 'true';
+                break;
+            }
             $lower = strtolower($name);
             if (in_array($lower, self::FORBIDDEN_HEADERS, true) || SecretScrubber::isSensitiveKey($name)) {
                 continue;
             }
-            $joined = is_array($val) ? implode(', ', $val) : $val;
-            $safe[$name] = SecretScrubber::scrub($joined);
+            $joined = is_array($val) ? implode(', ', array_slice($val, 0, 16)) : $val;
+            $safe[substr($name, 0, 128)] = substr(SecretScrubber::scrub(substr($joined, 0, 2048)), 0, self::MAX_HEADER_VALUE_BYTES);
+            ++$count;
         }
 
         return $safe;
     }
 
     /**
-     * Recursively redact sensitive fields and scrub secrets from query/body arrays.
+     * Recursively redact sensitive fields and scrub secrets from query/body arrays with hard node & entry bounds.
      *
      * @param array<mixed> $data
      * @return array<string, mixed>
      */
     public static function sanitizePayload(array $data, int $depth = 0): array
     {
-        if ($depth > 6) {
+        $remaining = self::MAX_PAYLOAD_NODES;
+
+        return self::sanitizePayloadBounded($data, $depth, $remaining);
+    }
+
+    /**
+     * @param array<mixed> $data
+     * @return array<string, mixed>
+     */
+    private static function sanitizePayloadBounded(array $data, int $depth, int &$remainingNodes): array
+    {
+        if ($depth > 6 || $remainingNodes <= 0) {
             return ['_truncated' => true];
         }
 
         $out = [];
+        $entriesAtLevel = 0;
         foreach ($data as $key => $value) {
-            $keyStr = (string) $key;
+            if ($entriesAtLevel >= self::MAX_ARRAY_ENTRIES || $remainingNodes <= 0) {
+                $out['_truncated'] = true;
+                break;
+            }
+            --$remainingNodes;
+            ++$entriesAtLevel;
+
+            $keyStr = substr((string) $key, 0, 128);
             $lower = strtolower($keyStr);
             $isSensitive = SecretScrubber::isSensitiveKey($keyStr);
             if (!$isSensitive) {
@@ -97,7 +127,7 @@ final readonly class IncidentRecord
             if ($isSensitive) {
                 $out[$keyStr] = '[REDACTED]';
             } elseif (is_array($value)) {
-                $out[$keyStr] = self::sanitizePayload($value, $depth + 1);
+                $out[$keyStr] = self::sanitizePayloadBounded($value, $depth + 1, $remainingNodes);
             } elseif (is_string($value)) {
                 $scrubbed = SecretScrubber::scrub(substr($value, 0, 4096));
                 $out[$keyStr] = substr($scrubbed, 0, 1024);

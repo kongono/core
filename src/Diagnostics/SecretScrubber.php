@@ -35,15 +35,14 @@ final class SecretScrubber
         ['/Bearer\s+[A-Za-z0-9._~+:\/%-]+={0,3}/i', 'Bearer [REDACTED]'],
         ['/Basic\s+[A-Za-z0-9+\/_-]+={0,3}/i', 'Basic [REDACTED]'],
         ['/(Authorization\s*:\s*(?:Digest|AWS4-HMAC-SHA256)\s+)[^\r\n]+/i', '$1[REDACTED]'],
-        ['/(^|[\r\n])([ \t]*(?:set-)?cookie\s*:\s*)[^\r\n]+/im', '$1$2[REDACTED]'],
         ['/\b((?:set-)?cookie\s*:\s*)[^\r\n]+/i', '$1[REDACTED]'],
         ['/\b(kongono_(?:session|remember)=)[^;\s"\']+/i', '$1[REDACTED]'],
         ['/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b/', '[REDACTED_JWT]'],
-        // Quoted, JSON, and PHP array-literal (=>) key-value secret assignments (bounded key prefix prevents PCRE backtrack limit DoS; consumes escaped quotes)
-        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|credential|cookie|session[_-]?id)["\']?\s*(?:=>|[:=])\s*)"(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^"\\\\\r\n])*+"/i', '$1"[REDACTED]"'],
-        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|credential|cookie|session[_-]?id)["\']?\s*(?:=>|[:=])\s*)\'(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^\'\\\\\r\n])*+\'/i', '$1\'[REDACTED]\''],
-        // Generic unquoted key=value / key: value / key => value secret assignments (bounded key prefix prevents PCRE backtrack bypass)
-        ['/(\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app_key|token|authorization|private[_-]?key|signing[_-]?key|cookie|session[_-]?id))(\s*(?:=>|[:=])\s*)(?!\[REDACTED)(?!(?:Bearer|Basic|Digest|AWS4-HMAC-SHA256)\s+\[REDACTED)[^\s,;\]"\'}]+/i', '$1$2[REDACTED]'],
+        // Quoted, JSON, and PHP array-literal (=>) key-value secret assignments (bounded key prefix/suffix prevents PCRE backtrack DoS; consumes escaped quotes)
+        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?key|token|jwt|authorization|private[_-]?key|signing[_-]?key|credentials?|cookie|session[_-]?id|totp|otp|recovery[_-]?code|stripe[_-]?signature)(?:[_-][A-Za-z0-9_-]{1,32})?["\']?\s*(?:=>|[:=])\s*)"(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^"\\\\\r\n])*+"/i', '$1"[REDACTED]"'],
+        ['/(["\']?\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?key|token|jwt|authorization|private[_-]?key|signing[_-]?key|credentials?|cookie|session[_-]?id|totp|otp|recovery[_-]?code|stripe[_-]?signature)(?:[_-][A-Za-z0-9_-]{1,32})?["\']?\s*(?:=>|[:=])\s*)\'(?!\[REDACTED)(?!Bearer\s+\[REDACTED)(?!Basic\s+\[REDACTED)(?:\\\\.|[^\'\\\\\r\n])*+\'/i', '$1\'[REDACTED]\''],
+        // Generic unquoted key=value / key: value / key => value secret assignments (bounded key prefix/suffix prevents PCRE backtrack bypass)
+        ['/(\b[A-Za-z0-9_-]{0,48}(?:password|passwd|passphrase|secret|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?key|token|jwt|authorization|private[_-]?key|signing[_-]?key|credentials?|cookie|session[_-]?id|totp|otp|recovery[_-]?code|stripe[_-]?signature)(?:[_-][A-Za-z0-9_-]{1,32})?)(\s*(?:=>|[:=])\s*)(?!\[REDACTED)(?!(?:Bearer|Basic|Digest|AWS4-HMAC-SHA256)\s+\[REDACTED)[^\s,;\]"\'}]+/i', '$1$2[REDACTED]'],
     ];
 
     /** @var list<string> */

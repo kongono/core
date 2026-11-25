@@ -18,13 +18,25 @@ final readonly class FileDevMailbox implements DevMailboxInterface
 
     public function append(array $message): void
     {
-        if (is_link($this->filePath)) {
+        $dir = dirname($this->filePath);
+        if ($this->isSymlink($this->filePath) || $this->isSymlink($dir)) {
             return;
         }
-        $dir = dirname($this->filePath);
         if (!is_dir($dir)) {
             @mkdir($dir, 0o700, true);
+            if (!is_dir($dir)) {
+                return;
+            }
         }
+
+        $sanitizedAttachments = array_map(
+            static fn(array $att): array => [
+                'filename' => SecretScrubber::scrub($att['filename']),
+                'content_type' => $att['content_type'],
+                'bytes' => $att['bytes'],
+            ],
+            $message['attachments'],
+        );
 
         $sanitized = [
             'id' => SecretScrubber::scrub($message['id']),
@@ -36,7 +48,7 @@ final readonly class FileDevMailbox implements DevMailboxInterface
             'subject' => SecretScrubber::scrub($message['subject']),
             'html' => null !== $message['html'] ? SecretScrubber::scrub($message['html']) : null,
             'text' => null !== $message['text'] ? SecretScrubber::scrub($message['text']) : null,
-            'attachments' => $message['attachments'],
+            'attachments' => $sanitizedAttachments,
         ];
 
         $handle = @fopen($this->filePath, 'c+b');
@@ -148,8 +160,15 @@ final readonly class FileDevMailbox implements DevMailboxInterface
 
     public function clear(): void
     {
-        if (!is_link($this->filePath) && is_file($this->filePath)) {
+        if (!$this->isSymlink($this->filePath) && is_file($this->filePath)) {
             @unlink($this->filePath);
         }
+    }
+
+    private function isSymlink(string $path): bool
+    {
+        clearstatcache(true, $path);
+
+        return is_link($path);
     }
 }
