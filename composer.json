@@ -1,17 +1,50 @@
 {
   "name": "kongono/core",
-  "description": "Kongono v1 persistent-runtime kernel, DI container, config, nondisclosing diagnostics, events, and ApplicationGraph.",
+  "description": "Kongono v1 persistent-runtime kernel, PSR-11 DI container, typed config, EnvLoader, EnvExampleGenerator, nondisclosing SecretScrubber diagnostics, pure-PHP caches (Memory/File/Redis), Fiber Async, events, and ApplicationGraph.",
   "type": "library",
   "license": "MIT",
+  "keywords": [
+    "php85",
+    "kongono",
+    "container",
+    "psr-11",
+    "psr-3",
+    "cache",
+    "redis",
+    "async",
+    "persistent-runtime"
+  ],
+  "homepage": "https://kongono.com",
+  "authors": [
+    {
+      "name": "Anthony Iovanna",
+      "email": "ant@kongono.com"
+    }
+  ],
+  "support": {
+    "issues": "https://github.com/kongono/framework/issues",
+    "source": "https://github.com/kongono/framework",
+    "docs": "https://kongono.com/docs"
+  },
   "require": {
-    "php": ">=8.5.0",
+    "php": ">=8.5.13",
+    "ext-json": "*",
+    "ext-mbstring": "*",
     "psr/container": "^2.0",
     "psr/event-dispatcher": "^1.0",
     "psr/log": "^3.0"
+  },
+  "suggest": {
+    "ext-openssl": "Required for TLS connections in RedisClient."
   },
   "autoload": {
     "psr-4": {
       "Kongono\\Core\\": "src/"
     }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "config": {
+    "sort-packages": true
   }
 }
